@@ -52,6 +52,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class SelfUpdater {
     static final String TAG = "SelfUpdate";
+    /**
+     * Przełącznik testowy: `adb shell setprop log.tag.SelfUpdateForce ASSERT`
+     * wymusza sprawdzenie wydania przy każdym cyklu. Pytamy o poziom INFO
+     * i odwracamy wynik, bo R8 w buildzie Chromium zamienia
+     * isLoggable(..., VERBOSE/DEBUG) na stałe false (-maximumremovedandroidloglevel).
+     */
+    private static final String FORCE_TAG = "SelfUpdateForce";
 
     private static final String PREFS = "self_update";
     /** Najwcześniejszy czas następnego zapytania o wydanie. */
@@ -64,7 +71,14 @@ public final class SelfUpdater {
     /** Czas startu systemu w chwili zlecenia; po restarcie zlecenie przepada. */
     private static final String K_COMMIT_BOOT = "commit_pending_boot_ms";
     /** LEVEL_*: jak ostre warunki stawiamy systemowi przy wyborze chwili instalacji. */
-    private static final String K_LEVEL = "constraint_level";
+    private static final String K_LEVEL = "idle_level";
+    /**
+     * Sesja, dla której system odrzucił zlecenie z warunkami. Dotyczy tylko tej
+     * jednej sesji: odmowa zależy od stanu, który się zmienia. Przeglądarka
+     * wgrana przez adb nie jest "instalatorem" samej siebie i dostaje
+     * SecurityException; po pierwszej własnej aktualizacji już nim jest.
+     */
+    private static final String K_PLAIN_SESSION = "plain_commit_session";
     /** System zażądał potwierdzenia dla bieżącej sesji. */
     private static final String K_CONFIRM = "confirm_mode";
     /** Kiedy użytkownik odrzucił okno systemu. */
@@ -150,7 +164,7 @@ public final class SelfUpdater {
             int sessionId = p.getInt(K_SESSION_ID, -1);
             // Tylko tryb bez warunków; pozostałe zlecają instalację wcześniej.
             if (sessionId == -1 || p.getBoolean(K_CONFIRM, false)
-                    || constraintLevel(p) != LEVEL_NONE || sBusy.get()) {
+                    || !usesPlainCommit(p, sessionId) || sBusy.get()) {
                 return;
             }
             if (!ctx.getPackageManager().canRequestPackageInstalls()) return;
@@ -279,8 +293,8 @@ public final class SelfUpdater {
     /** @return tag gotowego pliku albo pusty napis */
     private static String checkAndDownload(Context ctx, SharedPreferences p, File dir) {
         long now = System.currentTimeMillis();
-        // `adb shell setprop log.tag.SelfUpdate VERBOSE` wymusza sprawdzenie (testy).
-        boolean force = Log.isLoggable(TAG, Log.VERBOSE);
+        boolean force = !Log.isLoggable(FORCE_TAG, Log.INFO);
+        if (force) Log.i(TAG, "wymuszone sprawdzenie (log.tag." + FORCE_TAG + ")");
         long next = p.getLong(K_NEXT_CHECK, 0);
         // Drugi warunek: zegar cofnięty o więcej niż dobę nie może zablokować sprawdzania.
         if (!force && now < next && next - now <= DAY_MS) return "";
@@ -353,8 +367,8 @@ public final class SelfUpdater {
             sConfirmSessionId = sessionId;
             return Installer.commit(ctx, sessionId);
         }
-        int level = constraintLevel(p);
-        if (level != LEVEL_NONE) {
+        if (!usesPlainCommit(p, sessionId)) {
+            int level = constraintLevel(p);
             long pending = p.getLong(K_COMMIT_PENDING, 0);
             if (pending != 0 && within(pending, now, CONSTRAINT_TIMEOUT_MS + RETRY_MS)
                     && Math.abs(bootTime() - p.getLong(K_COMMIT_BOOT, 0)) < 5 * MINUTE_MS) {
@@ -366,8 +380,8 @@ public final class SelfUpdater {
                         .apply();
                 return true;
             }
-            // System nie przyjmuje zleceń z warunkami -- zostaje zwykłe zlecenie.
-            p.edit().putInt(K_LEVEL, LEVEL_NONE).apply();
+            // System odrzucił zlecenie z warunkami -- dla TEJ sesji zwykłe zlecenie.
+            p.edit().putInt(K_PLAIN_SESSION, sessionId).apply();
         }
         // Tryb bez warunków: z pierwszego planu zleci to onForegroundEnd.
         return sForeground || Installer.commit(ctx, sessionId);
@@ -415,6 +429,11 @@ public final class SelfUpdater {
             return installed;
         }
         return UpdaterConfig.RELEASE_TAG;
+    }
+
+    /** Czy tę sesję zlecamy zwykłym commitem przy zejściu przeglądarki z ekranu. */
+    private static boolean usesPlainCommit(SharedPreferences p, int sessionId) {
+        return constraintLevel(p) == LEVEL_NONE || p.getInt(K_PLAIN_SESSION, -1) == sessionId;
     }
 
     private static int constraintLevel(SharedPreferences p) {
