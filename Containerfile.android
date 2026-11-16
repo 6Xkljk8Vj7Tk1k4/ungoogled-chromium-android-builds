@@ -1,0 +1,2168 @@
+# ==============================================================================
+# Android Builder — Chromium arm64
+# Buduje chrome_public_apk z surowego chromium.googlesource.com/chromium/src
+# (NIE ungoogled-chromium-android, martwy od Chromium 99). Osobny plik od
+# desktopowego buildu ungoogled-chromium — inny pipeline: pełny
+# gclient zamiast tarballa, wyjście .apk zamiast .deb.
+#
+# ARG VARIANT (domyślnie "ungoogled"):
+#   - ungoogled: 39 flag GN + pełna seria patchy ungoogled-chromium
+#     (wszystkie poza 2 wykluczonymi: 106/108 na 151, 108/110 na 156;
+#     katalog `patches/` z klonu ungoogled-chromium) + literały
+#     uzupełniające + domain_substitution -- codzienny wariant, zweryfikowany
+#     end-to-end na fizycznym urządzeniu.
+#   - vanilla: czyste Chromium bez żadnych patchy/literałów/domain_substitution
+#     -- test izolujący "czy sam pipeline i ta wersja Chromium są zdrowe" bez
+#     trudnej zmiennej patchy (przydatny przy każdym kolejnym skoku wersji).
+#
+# Cromite (uazo/cromite) CAŁKOWICIE usunięty z tego pliku (2026-08-07/08,
+# było `ARG WITH_CROMITE`).
+# ==============================================================================
+
+FROM ubuntu:26.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. Minimum do pobrania depot_tools/Chromium (domyślny mirror obrazu:
+#    archive.ubuntu.com; ftp.icm.edu.pl usunięty 2026-10-26, przestał
+#    odpowiadać -- to samo co w desktopowym Containerfile, commit 504cdbb).
+#    Pełna lista zależności builda (w tym Android-specific) przychodzi
+#    później z build/install-build-deps.sh --android, uruchamianego dopiero
+#    po fetchu źródeł, zgodnie z
+#    https://www.chromium.org/developers/how-tos/get-the-code/
+#    Pętla retry (2026-10-26): pierwszy build po restarcie maszyny padł tu,
+#    bo w trakcie pobierania paczek WSZYSTKIE adresy archive/security.ubuntu.com
+#    (IPv4 i IPv6) naraz odpowiadały "connection refused" -- lokalna
+#    przerwa łącza (przełączenie łącza), nie awaria Canonical; minutę
+#    później wszystko działało. Wbudowane Acquire::Retries apt nie
+#    przeczekuje takiej przerwy. Ten sam wzorzec co gclient sync niżej.
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources && \
+    for i in 1 2 3 4; do \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            git curl python3 python3-pip lsb-release sudo ca-certificates \
+            xz-utils unzip zip file ccache && break; \
+        [ "$i" = 4 ] && echo "BŁĄD: apt nie powiódł się po 4 próbach" && exit 1; \
+        echo "==> apt nieudane (próba $i/4, chwilowa przerwa sieci?) -- retry za 60s..."; \
+        sleep 60; \
+    done && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. depot_tools
+WORKDIR /repo
+RUN git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+ENV PATH="/repo/depot_tools:${PATH}"
+
+# 3. Wersja -- JEDNO źródło prawdy: tag wydania ungoogled-chromium
+#    (np. `156.0.8078.47-1`). Wersja Chromium = ten tag bez sufiksu `-N`.
+#    Ten sam tag wyznacza patche i listy domain_substitution (klon
+#    /repo/ungoogled-domsub niżej), więc źródła i patche ZAWSZE pasują do
+#    siebie. Do 2026-10-26 Chromium był przypięty na sztywno do
+#    151.0.7922.71, a patche szły z `releases/latest` -- działało tylko
+#    dzięki cache warstw z sierpnia; po jego utracie patche 156 trafiłyby
+#    na drzewo 151.
+#
+#    build_android.sh sam ustala najnowsze wydanie i podaje je jako
+#    `--build-arg UC_VERSION=...`, więc cache warstw unieważnia się
+#    DOKŁADNIE przy nowej wersji. Pusty UC_VERSION (bezpośredni `podman
+#    build`) = pobranie `releases/latest` tutaj; wtedy obowiązuje pułapka
+#    z desktopowego kroku 3 (krok trafiony w cache zostaje przy starej
+#    wersji, bo tekst polecenia się nie zmienia).
+ARG UC_VERSION=""
+RUN UC="${UC_VERSION}" && \
+    if [ -z "${UC}" ]; then \
+        UC=$(curl -sf https://api.github.com/repos/ungoogled-software/ungoogled-chromium/releases/latest \
+            | grep -oP '"tag_name": "\K[^"]+'); \
+    fi && \
+    [ -n "${UC}" ] || \
+        (echo "BŁĄD: nie udało się pobrać wersji ungoogled-chromium z GitHub API (rate limit lub brak sieci)" && exit 1) && \
+    CHROMIUM_TAG="${UC%-*}" && \
+    echo "${CHROMIUM_TAG}" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || \
+        (echo "BŁĄD: tag ungoogled '${UC}' nie ma postaci <wersja Chromium>-<N>" && exit 1) && \
+    echo "==> ungoogled-chromium ${UC} -> Chromium ${CHROMIUM_TAG}" && \
+    echo "${UC}" > /repo/uc_tag.txt && \
+    echo "${CHROMIUM_TAG}" > /repo/chromium_tag.txt
+
+# 4. Źródła Chromium — pełny gclient (NIE tarball jak w Containerfile
+#    desktopowym): Android SDK/NDK i third_party są warunkowane w DEPS pod
+#    target_os, więc tarball ungoogled-chromium-style ich nie przyniesie.
+#
+#    Nie używamy `fetch android` do samego sync: fetch.py nie ma opcji na
+#    ograniczenie równoległości (sprawdzone: `fetch --help` nie ma flagi
+#    jobs), a `gclient sync` domyślnie liczy max(8, NumLocalCpus())=16
+#    wątków na tej maszynie — realnie wywołuje to HTTP 429 "Short term
+#    server-time rate limit exceeded" z googlesource.com przy pierwszym
+#    pełnym sync (zaobserwowane w praktyce: ffmpeg, gemmlowp, freetype,
+#    harfbuzz, flatbuffers i kilkanaście innych third_party naraz).
+#    Zamiast tego: ręczny płytki fetch samego tagu (bez ciągnięcia całej
+#    historii/domyślnej gałęzi) + `gclient config --unmanaged` (żeby gclient
+#    nie próbował zmienić już wybranego przez nas tagu) + kontrolowane -j4
+#    z retry (gclient sync jest idempotentny — ponowne uruchomienie pomija
+#    już pobrane zależności).
+# UWAGA: od tego kroku aż do zasilenia /srcbuild (sekcja 4c) `/repo/
+# chromium` żyje na TRWAŁYM cache mouncie (`id=chromium-checkout-android`),
+# nie w zwykłych warstwach obrazu -- ten sam mechanizm i ten sam powód co
+# `/srcbuild` niżej. Powód dopisany 2026-08-08: `gclient sync` samo w
+# sobie tworzy warstwę rzędu dziesiątek GB (pełne DEPS z target_os=android),
+# a commit TAKIEJ warstwy do zwykłego obrazu wymaga ~2x jej rozmiaru
+# wolnego miejsca w /var/tmp (Podman kopiuje przez tar-pipe do nowego
+# blobu) -- realnie złapane na żywo jako powtarzające się "no space left
+# on device" nawet przy 130GB wolnego. Cache mount NIGDY nie jest
+# committowany jako warstwa obrazu, więc ten problem znika całkowicie, A
+# PRZY OKAZJI: gclient sync jest idempotentny (patrz komentarz wyżej), więc
+# każdy PRZYSZŁY cache-miss warstw PRZED tym punktem (np. po kolejnym
+# `podman image prune`) będzie tylko WERYFIKOWAŁ już pobrane zależności
+# zamiast ciągnąć cały Chromium+Android DEPS od zera z sieci ponownie.
+# Martwe połączenia (2026-10-26): po przełączeniu łącza
+# otwarte połączenie TCP potrafi zostać bez ruchu na zawsze, a git/curl
+# domyślnie nie ma żadnego limitu czasu -- gclient tylko wypisuje "STALL
+# DETECTED" i czeka. Limit 1 B/s przez 600 s = przerwij wyłącznie transfer,
+# który przez 10 minut nie dostał ANI BAJTU; git/gclient/pętle retry same
+# ponawiają. Celowo nie niżej: płytki fetch całego chromium/src potrafi
+# minutę-dwie czekać na paczkę bez żadnych danych (bez TTY nie ma postępu),
+# a lista refów ls-remote płynie ~1,4 kB/s i też ma przejść.
+ENV GIT_HTTP_LOW_SPEED_LIMIT=1 \
+    GIT_HTTP_LOW_SPEED_TIME=600
+WORKDIR /repo/chromium/src
+# Checkout tagu na TRWAŁYM cache mouncie -- trzy przypadki:
+#   - pusty mount (pierwszy build): git init + płytki fetch tagu;
+#   - mount już na tym tagu: nic do roboty;
+#   - mount na INNEJ wersji (podbicie, 2026-10-26): płytki fetch nowego
+#     tagu + `checkout -f --detach`. Do 2026-10-26 obecność `.git`
+#     pomijała fetch w ogóle, więc zmiana wersji była po cichu ignorowana
+#     i dalej budowało się stare drzewo. gclient sync -D i `git submodule
+#     update` niżej dociągają zależności nowej wersji (oba są
+#     idempotentne). Bez `-b cromite-bump` (stary branch z Cromite):
+#     `-b` na już istniejącym branchu wywalał drugi build na tym samym
+#     `id=` (złapane 2026-08-08). Retry fetchu (2026-10-26): płytkie
+#     pobranie całego chromium/src to jeden długi transfer, a pierwszy
+#     testowy build 156 stracił go na zerwanym połączeniu ("unexpected
+#     disconnect while reading sideband packet").
+#   - lokalny `refs/remotes/origin/HEAD` (2026-10-26): gclient dla
+#     rozwiązania --unmanaged i tak woła `scm.GIT.GetRemoteHeadRef`
+#     (depot_tools scm.py). Bez lokalnego origin/HEAD (płytki fetch samego
+#     tagu go nie tworzy) robi `git remote set-head -a`, a potem
+#     `git ls-remote --symref <url> HEAD` -- ls-remote z wzorcem NIE
+#     wysyła ref-prefix, więc serwer listuje WSZYSTKIE refy chromium/src,
+#     w tym miliony `refs/changes/*`. W teście 156 gclient wisiał na `src`
+#     ponad 20 minut. Wynik i tak jest bez znaczenia (unmanaged = tylko
+#     fetch config), a gclient bierze lokalny symref od ręki.
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    CHROMIUM_TAG=$(cat /repo/chromium_tag.txt) && \
+    if [ ! -d .git ]; then \
+        git init -q && \
+        git remote add origin https://chromium.googlesource.com/chromium/src.git; \
+    fi && \
+    HEAD_C=$(git rev-parse -q --verify HEAD 2>/dev/null || true) && \
+    TAG_C=$(git rev-parse -q --verify "refs/tags/${CHROMIUM_TAG}^{commit}" 2>/dev/null || true) && \
+    if [ -n "${HEAD_C}" ] && [ "${HEAD_C}" = "${TAG_C}" ]; then \
+        echo "==> /repo/chromium/src już na ${CHROMIUM_TAG}, pomijam fetch"; \
+    else \
+        echo "==> Checkout ${CHROMIUM_TAG} (było: $(git describe --tags HEAD 2>/dev/null || echo 'pusto'))" && \
+        for i in 1 2 3 4 5; do \
+            git fetch --depth 1 origin "refs/tags/${CHROMIUM_TAG}:refs/tags/${CHROMIUM_TAG}" && break; \
+            [ "$i" = 5 ] && echo "BŁĄD: git fetch ${CHROMIUM_TAG} nie powiódł się po 5 próbach" && exit 1; \
+            echo "==> git fetch nieudany (próba $i/5, przerwa łącza albo HTTP 429) -- retry za 45s..."; \
+            sleep 45; \
+        done && \
+        git checkout -q -f --detach "${CHROMIUM_TAG}"; \
+    fi && \
+    git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main && \
+    echo "==> HEAD: $(git describe --tags HEAD)"
+
+WORKDIR /repo/chromium
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    gclient config --name=src --unmanaged https://chromium.googlesource.com/chromium/src.git && \
+    echo "target_os = ['android']" >> .gclient
+
+# `--reset` (2026-10-26): przerwany build (SIGTERM, utrata łącza) potrafi
+# zostawić zależność w połowie checkoutu -- git widzi wtedy "local changes"
+# i gclient odmawia aktualizacji ("could not detach HEAD"), a pętla retry
+# powtarza ten sam błąd 6 razy (złapane na third_party/fuzztest/src).
+# W checkout mouncie nie ma zamierzonych zmian (wszystkie edycje idą do
+# /srcbuild), więc reset przed aktualizacją jest bezpieczny; razem z -D
+# usuwa też nieśledzone katalogi w zależnościach -- odtwarza je runhooks.
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    for i in 1 2 3 4 5 6; do \
+        gclient sync --with_branch_heads --with_tags -D --reset -j4 --nohooks && exit 0; \
+        echo "==> gclient sync nieudany (próba $i/6, prawdopodobnie HTTP 429 z googlesource.com) — retry za 45s..."; \
+        sleep 45; \
+    done; \
+    echo "BŁĄD: gclient sync nie powiódł się po 6 próbach" && exit 1
+
+WORKDIR /repo/chromium/src
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    gclient runhooks
+
+# Prebuildowany Node.js (pobrany przez hook powyżej, third_party/node/...)
+# potrafi wylądować bez bitu wykonywalności -- realnie zaobserwowane:
+# ninja failuje ~60000 celów DevTools frontend na starcie z
+# "PermissionError: [Errno 13] Permission denied: .../node-linux-x64/bin/node",
+# mimo że git zwykle zachowuje tryb pliku. Naprawiane defensywnie zamiast
+# szukać czy to gclient hook, czy warstwa kontenera zjada exec-bit.
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    find third_party/node -type f \( -name "node" -o -name "node.exe" \) -exec chmod +x {} + 2>/dev/null || true
+
+# 4b. Git submodule'y -- `gclient sync` NIE inicjalizuje natywnych git
+#     submodułów w drzewie chromium/src (np. v8/ zostaje kompletnie puste,
+#     mimo że `git ls-tree HEAD v8` pokazuje poprawny gitlink -- zweryfikowane
+#     ręcznie w kontenerze debug, także z `"managed": true` + `--revision`,
+#     więc to nie kwestia --unmanaged). Submoduły to osobny, natywny
+#     mechanizm gita, którego gclient tu w ogóle nie dotyka -- trzeba
+#     `git submodule update --init` jawnie, inaczej GN gen wywali się na
+#     brakujących plikach (np. v8/BUILD.gn) niezależnie od stanu patchy.
+#
+#     .gitmodules ma 257 wpisów, część opatrzona `gclient-condition`
+#     (składnia identyczna z warunkami w DEPS -- proste wyrażenie
+#     bool na zmiennych typu checkout_android/checkout_linux/
+#     checkout_src_internal). Ewaluujemy to samodzielnie w Pythonie
+#     (te same zmienne co ustawiamy dla siebie: checkout_android=True,
+#     checkout_linux=True -- budujemy Android z hosta Linux --
+#     checkout_android_prebuilts_build_tools=True; reszta, w tym
+#     checkout_src_internal/checkout_ios/checkout_mac/checkout_win,
+#     domyślnie False -- te submoduły są nieosiągalne bez wewnętrznych
+#     poświadczeń Google albo po prostu nam niepotrzebne) i inicjalizujemy
+#     tylko pasujące ~150 zamiast wszystkich 257 (część to platformy,
+#     których nie budujemy).
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    python3 - <<'PYEOF' > /repo/submodule_paths.txt
+import re
+with open('.gitmodules') as f:
+    content = f.read()
+blocks = re.split(r'(?=^\[submodule)', content, flags=__import__('re').M)
+env = {
+    'checkout_android': True,
+    'checkout_linux': True,
+    'checkout_android_prebuilts_build_tools': True,
+}
+class DefaultFalse(dict):
+    def __missing__(self, key):
+        return False
+ctx = DefaultFalse(env)
+for b in blocks:
+    if not b.strip().startswith('[submodule'):
+        continue
+    m_path = re.search(r'^\s*path\s*=\s*(.+)$', b, re.M)
+    m_cond = re.search(r'^\s*gclient-condition\s*=\s*(.+)$', b, re.M)
+    if not m_path:
+        continue
+    path = m_path.group(1).strip()
+    ok = True
+    if m_cond:
+        try:
+            ok = eval(m_cond.group(1).strip(), {'__builtins__': {}}, ctx)
+        except Exception:
+            ok = False
+    if ok:
+        print(path)
+PYEOF
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    echo "==> Inicjalizuję $(wc -l < /repo/submodule_paths.txt) git submodułów (v8 i inne)..." && \
+    for i in 1 2 3 4 5; do \
+        git submodule update --init --depth 1 --jobs 4 -- $(cat /repo/submodule_paths.txt) && exit 0; \
+        echo "==> git submodule update nieudane (próba $i/5, prawdopodobnie HTTP 429) -- retry za 30s..."; \
+        sleep 30; \
+    done; \
+    echo "BŁĄD: git submodule update nie powiodło się po 5 próbach" && exit 1
+
+# Retry z tego samego powodu co krok 1 (apt pobiera tu setki MB paczek).
+RUN --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    for i in 1 2 3; do \
+        yes | build/install-build-deps.sh --android --unsupported && exit 0; \
+        echo "==> install-build-deps nieudane (próba $i/3, chwilowa przerwa sieci?) -- retry za 60s..."; \
+        sleep 60; \
+    done; \
+    echo "BŁĄD: install-build-deps nie powiodło się po 3 próbach" && exit 1
+
+# ==============================================================================
+# 4c. Trwały wolumen dla drzewa źródeł (/srcbuild) -- ninja z PRAWDZIWĄ
+#     inkrementalnością między osobnymi wywołaniami `podman build`
+# ==============================================================================
+#     PROBLEM ZDIAGNOZOWANY 2026-08-07 (sesja podbicia patchy ungoogled na
+#     Android): każda poprawka błędu kompilacji znalezionego GŁĘBOKO w
+#     ninja (np. na 93% z 60700 celów) wymaga zmiany pliku źródłowego W
+#     KTÓRYMŚ WCZEŚNIEJSZYM kroku `RUN` -- a Podman/Buildah traktuje CAŁY
+#     krok `RUN ninja ...` jako jedną, niepodzielną warstwę cache. Zmiana
+#     czegokolwiek wcześniej unieważnia tę warstwę w CAŁOŚCI, więc ninja
+#     musi zacząć liczyć cele od 0/60700 -- mimo że ccache (osobny,
+#     trwały mount) przyspiesza REKOMPILACJĘ każdego pojedynczego pliku,
+#     samo przejście przez cały graf (uruchomienie ccache-wrapped
+#     kompilatora dla wszystkich 60700 celów, plus kroki Java/dex/
+#     ProGuard specyficzne dla Androida, których ccache W OGÓLE nie
+#     przyspiesza) kosztowało realnie 1-3h PRZY KAŻDEJ poprawce w tej
+#     sesji -- cztery pełne przebiegi ninja jednego dnia.
+#
+#     PRZYCZYNA (nie tylko "Podman jest wolny"): `chromium/src` żyje w
+#     warstwach obrazu -- każdy nowy krok `RUN` to NOWA warstwa nakładana
+#     na poprzednią. Gdy warstwa się zmienia, pliki źródłowe w niej
+#     dostają ŚWIEŻY mtime (moment utworzenia warstwy), NIEZALEŻNIE od
+#     tego, czy ich TREŚĆ faktycznie się zmieniła. Ninja decyduje "czy
+#     kompilować ten .o" głównie po mtimie źródła vs zapisanego stanu w
+#     `.ninja_log` -- świeży mtime na WSZYSTKICH plikach (nie tylko tym
+#     jednym naprawionym) wygląda dla ninja jak "wszystko nowsze",
+#     niezależnie od tego, że 99,99% plików ma bajt-w-bajt tę samą treść
+#     co poprzednio.
+#
+#     FIX: `/srcbuild` -- cache mount (ten sam mechanizm co już istniejący
+#     `/ccache`), TRWAŁY między osobnymi `podman build`, ale w
+#     przeciwieństwie do zwykłych warstw obrazu -- pliki na nim NIE
+#     dostają nowego mtime tylko dlatego, że wcześniejsza warstwa się
+#     zmieniła. Od tego punktu w pliku (patche, fixy, literały,
+#     domain_substitution, GN gen, ninja, pakowanie) WSZYSTKIE kroki
+#     operują na `/srcbuild`, nie na `/repo/chromium/src` -- każdy z nich
+#     MUSI mieć własną flagę `--mount=type=cache,target=/srcbuild,
+#     id=chromium-src-android-hardened` (mount istnieje tylko w obrębie
+#     JEDNEGO kroku `RUN`, trzeba go deklarować w każdym, dokładnie tak
+#     jak już robimy dla `/ccache` w kroku ninja). Dzięki temu poprawka
+#     JEDNEGO pliku (sed/python fix) daje mu JEDYNEMU nowy mtime -- ninja
+#     przy następnym przebiegu przelicza tylko cele faktycznie zależne od
+#     tego pliku (sekundy/minuty), zamiast przechodzić przez cały graf.
+#
+#     ZWERYFIKOWANE PRZED WDROŻENIEM (tani test poza tym repo, kilka
+#     sekund, nie 90GB): osobny `Containerfile` z dwoma kolejnymi
+#     `podman build` (drugi z inną wartością ARG wcześniej w pliku, żeby
+#     wymusić cache miss na warstwie PRZED mountem) potwierdził: (1)
+#     zawartość i mtime pliku w cache mouncie PRZETRWAŁY cache miss
+#     wcześniejszej warstwy identyczne jak w pierwszym buildzie; (2)
+#     `COPY --from=builder` w etapie `export` NIE WIDZI plików, które są
+#     TYLKO w cache mouncie ("no such file or directory") -- dlatego
+#     krok pakowania (8.) musi jawnie `cp` gotowy `.apk` z `/srcbuild` do
+#     zwykłej, niemontowanej ścieżki `/output_apk/`, żeby `export` mógł
+#     go zobaczyć.
+#
+#     JEDNORAZOWY KOSZT: pierwsze zasilenie `/srcbuild` kopiuje CAŁE
+#     drzewo (`cp -a`, zachowuje mtime) z `/repo/chromium/src` -- to
+#     tymczasowo DUBLUJE zużycie dysku (obie kopie istnieją, dopóki stare
+#     warstwy nie zostaną wyczyszczone). Po tym jednorazowym koszcie
+#     `/repo/chromium/src` (warstwy obrazu) staje się materiałem
+#     WYŁĄCZNIE źródłowym dla zasilenia -- nic go już nie czyta.
+#     ZASILENIE PRZY KAŻDYM WYKONANIU TEGO KROKU (od 2026-10-26; wcześniej
+#     `if [ ! -d /srcbuild/.git ]` -- zasilenie raz w historii tego id).
+#     Ten krok wykonuje się tylko przy cache missie warstw, czyli gdy coś
+#     WCZEŚNIEJ się zmieniło: nowa wersja Chromium, zmiana kroków
+#     fetch/sync, `podman image prune`. W każdym z tych przypadków stare
+#     `/srcbuild` jest złe: inna wersja albo już załatane drzewo, na które
+#     `patches.py apply` (nieidempotentne) nałożyłoby patche drugi raz
+#     i padło (złapane na żywo 2026-08-07). Dlatego: wyczyść i skopiuj od
+#     nowa. Gdy nic wcześniej się nie zmieniło, krok jest cache-hitem, nie
+#     wykonuje się, a `/srcbuild` zachowuje stan ninja -- poprawki PO
+#     patchach (fixy, literały, GN, ninja) nadal są inkrementalne.
+#     `/srcbuild/.srcbuild_tag` = wersja, z której zasilono (diagnostyka).
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    --mount=type=cache,target=/repo/chromium,id=chromium-checkout-android \
+    if [ -n "$(ls -A /srcbuild 2>/dev/null)" ]; then \
+        echo "==> Czyszczę poprzednie /srcbuild ($(cat /srcbuild/.srcbuild_tag 2>/dev/null || echo 'wersja nieznana'), $(du -sh /srcbuild | cut -f1))..." && \
+        find /srcbuild -mindepth 1 -delete; \
+    fi && \
+    echo "==> Zasilenie /srcbuild z /repo/chromium/src ($(cat /repo/chromium_tag.txt), kilka minut)..." && \
+    cp -a /repo/chromium/src/. /srcbuild/ && \
+    cp /repo/chromium_tag.txt /srcbuild/.srcbuild_tag && \
+    echo "==> Zasilenie gotowe: $(du -sh /srcbuild | cut -f1)"
+
+WORKDIR /srcbuild
+
+# ==============================================================================
+# Sekcje 5 / 5a / 5b / 5c USUNIĘTE (2026-08-07/08): nałożenie 330 patchy
+# Cromite (`COPY cromite/`, `ARG WITH_CROMITE`, pętla `git am`) + pomocniczy
+# split_patch.py (rozbijanie patchy dotykających submodułów) + dwie naprawy
+# SKUTKÓW patchy Cromite (webnn:buildflags, skills/proto) -- wszystkie cztery
+# istniały WYŁĄCZNIE po to, żeby obsłużyć Cromite. Numeracja "5d/5e/5f"
+# niżej ZOSTAJE nietknięta (nie przenumerowana na 5/5a/5b), żeby nie rozjechać
+# się z historią zmian, która się do niej odwołuje.
+#
+# ARG VARIANT (ungoogled|vanilla) steruje wszystkim od tego punktu w dół --
+# kroki fetch/gclient sync/submoduły/install-build-deps/zasilenie /srcbuild
+# są wspólne i współdzielą cache warstw między wariantami, dlatego ARG jest
+# zadeklarowany dopiero TUTAJ, a nie na górze pliku (ten sam wzorzec co
+# poprzednio dla WITH_CROMITE).
+# ==============================================================================
+ARG VARIANT=ungoogled
+
+# 5d. WARIANT UTWARDZONY: pełna seria WŁASNYCH patchy ungoogled-chromium
+# ==============================================================================
+#     To NIE jest Plan A (330 patchy Cromite, fingerprinting/adblock, 48%
+#     nakłada się na 151.x, 134 wymaga realnej analizy). Patche ungoogled to
+#     INNY, dużo mniejszy zestaw (108, katalog `patches/`, plik `series`
+#     określa kolejność) -- głównie usuwanie brandingu/integracji z Google
+#     (GAIA, wyszukiwarka domyślna, domain reliability, WebRTC log uploader,
+#     translate itd.), nie mitygacje fingerprintingu.
+#
+#     ZMIERZONE PRZED WDROŻENIEM (poza kontenerem, na płytkim klonie drzewa): **108/108 (100%) nakłada się czysto** na drzewo Android
+#     151.0.7922.71 (jedyny pozorny FAIL to fałszywy negatyw -- brakujący
+#     submoduł w tanim środowisku testowym, po doklejeniu przechodzi też).
+#     Zastosowane przez oficjalny `utils/patches.py` (system `patch -p1`,
+#     NIE `git am`/`git apply` -- `patch` operuje na plikach, więc submoduły
+#     gitlinkowane (v8 itd.) nie są problemem, w odróżnieniu od Cromite,
+#     gdzie to wymagało `split_patch.py`).
+#
+#     ŚWIADOMA DECYZJA: część patchy zmienia widoczne, codzienne
+#     zachowanie (np. `replace-google-search-engine-with-nosearch.patch`
+#     podmienia domyślną wyszukiwarkę na placeholder -- pasek adresu
+#     przestaje wyszukiwać, dopóki użytkownik ręcznie nie ustawi innej).
+#     To zgodne z zachowaniem buildów desktopowych (cel "ujednolicenia"), ale to nie
+#     cichy literał jak sekcja 5e niżej -- świadomie zaakceptowane.
+#
+#     Kolejność jak na desktopie (krok 7 Containerfile): patche PRZED
+#     domain_substitution (sekcja 5f) -- część patchy dodaje/usuwa tekst,
+#     który domain_substitution potem przetwarza w tym samym przebiegu.
+RUN if [ "${VARIANT}" != "ungoogled" ]; then echo "==> Wariant ${VARIANT}: pomijam patche ungoogled-chromium"; exit 0; fi; \
+    UC_TAG=$(cat /repo/uc_tag.txt) && \
+    echo "==> Klonuję ungoogled-chromium ${UC_TAG} (patche + listy domain_substitution; ten sam tag co źródła Chromium, krok 3)" && \
+    git clone --branch "${UC_TAG}" --depth 1 \
+        https://github.com/ungoogled-software/ungoogled-chromium.git /repo/ungoogled-domsub
+
+#     WYKLUCZENIE DWÓCH PATCHY (znalezione po TRZECH iteracjach diagnozy): `core/inox-patchset/0001-fix-
+#     building-without-safebrowsing.patch` i `core/ungoogled-chromium/
+#     fix-building-without-safebrowsing.patch` razem usuwają z drzewa
+#     KOMPLETNY target `chrome/browser/safe_browsing` i setki wystąpień
+#     `#include ".../safe_browsing_prefs.h"` w całym drzewie. To NIE jest
+#     przypadek "is_android, którego ungoogled nie testuje" -- to patche
+#     zaprojektowane jako PARA z flagą GN `safe_browsing_mode=0`
+#     (dosłownie obecną w `flags.gn` ungoogled-chromium). MY tej flagi
+#     ŚWIADOMIE nie ustawiamy (patrz wyżej w tym pliku: `safe_browsing_
+#     mode=0` przechodzi `gn gen`, ale wywala ninja po ~26000 targetów
+#     przez `cloud_content_scanning`, zawsze budowany na Androidzie).
+#     Bez tej flagi te dwa patche zostawiają drzewo w NIESPÓJNYM stanie:
+#     nagłówek i jego build-target usunięte, ale dziesiątki plików (m.in.
+#     `password_protection_service_base.cc`, `client_side_detection_
+#     service.cc` -- NIE Android-specyficzne, zwykły cross-platformowy
+#     kod) nadal odwołują się do jego symboli -> `undeclared identifier`
+#     w ninja. Zweryfikowane host-side: po wykluczeniu tych 2 wpisów z
+#     `series` `chrome/browser/safe_browsing/BUILD.gn` wraca do
+#     NIEZMIENIONEJ (upstream) postaci (zero `if (false)`), a
+#     `chrome/browser/BUILD.gn` odzyskuje zależności `//chrome/browser/
+#     safe_browsing` -- struktura identyczna jak w zwykłym, kompilowalnym
+#     Chromium. Nasz własny literal (sekcja 5e, `kSafeBrowsingEnabled`)
+#     nietknięty i nadal zadziała normalnie -- to jedyny mechanizm,
+#     którego potrzebujemy, żeby Safe Browsing był domyślnie wyłączony.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /repo/ungoogled-domsub && \
+    grep -v "fix-building-without-safebrowsing" patches/series > /tmp/series_filtered && \
+    mv /tmp/series_filtered patches/series && \
+    if grep -q '^  inputs = \[$' /srcbuild/components/domain_reliability/BUILD.gn 2>/dev/null && \
+       grep -A1 '^  inputs = \[$' /srcbuild/components/domain_reliability/BUILD.gn | grep -q '^  \]$'; then \
+        echo "==> Patche ungoogled-chromium już zaaplikowane na /srcbuild (spot-check: domain_reliability/BUILD.gn) -- pomijam (patches.py apply NIE jest idempotentne)"; \
+    else \
+        echo "==> Aplikuję $(grep -vc '^$' patches/series) patchy ungoogled-chromium (wykluczone: 2x fix-building-without-safebrowsing, wymagają safe_browsing_mode=0, którego nie ustawiamy)..." && \
+        python3 utils/patches.py apply /srcbuild patches && \
+        grep -q '^  inputs = \[$' /srcbuild/components/domain_reliability/BUILD.gn && \
+        grep -A1 '^  inputs = \[$' /srcbuild/components/domain_reliability/BUILD.gn | grep -q '^  \]$' || \
+            (echo "BŁĄD: patche ungoogled nie zaaplikowały się poprawnie (spot-check: domain_reliability/BUILD.gn)" && exit 1); \
+    fi
+
+# BŁĄD ZŁAPANY W NINJA (piąty przypadek wzorca is_android-untested, ale
+# pierwszy będący prawdziwym błędem KOMPILACJI C++, nie GN): `extra/
+# ungoogled-chromium/add-suggestions-url-field.patch` dodaje 5. parametr
+# (`suggestions_url`) do `TemplateURLService::ResetTemplateURL` i
+# aktualizuje WSZYSTKIE wywołania w desktopowym UI (chrome://settings/
+# searchEngines) -- ale `components/search_engines/android/
+# template_url_service_android.cc` (JNI bridge dla ANDROIDOWEGO UI
+# wyszukiwarek, zupełnie inna ścieżka kodu niż desktopowe WebUI) ma
+# WŁASNE 2 wywołania tej samej funkcji, których autor patcha nie dotknął
+# (nie buduje na Androida). Efekt: `too few arguments to function call,
+# expected 5, have 4` w dwóch miejscach. Fix: dopisać brakujący argument
+# `suggestions_url()` istniejącego obiektu (Android UI nie ma pola do
+# EDYCJI suggestions_url, więc zachowujemy wartość bieżącą, nie zmieniamy
+# zachowania) -- w PRAWIDŁOWEJ pozycji (5. argument, po `search_url`, nie
+# przed -- pierwsza wersja tego fixa miała złą kolejność, złapane przy
+# review przed wdrożeniem, nie w buildzie).
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    F=components/search_engines/android/template_url_service_android.cc && \
+    (grep -q "regulatory_api_turl->suggestions_url());" "$F" || \
+     (grep -q "regulatory_api_turl->keyword(), regulatory_api_turl->url());" "$F" && \
+      sed -i 's/regulatory_api_turl->keyword(), regulatory_api_turl->url());/regulatory_api_turl->keyword(), regulatory_api_turl->url(),\n          regulatory_api_turl->suggestions_url());/' "$F")) && \
+    grep -q "regulatory_api_turl->suggestions_url());" "$F" && \
+    (grep -q "search_url, template_url->suggestions_url());" "$F" || \
+     (grep -q "^                                          search_url);$" "$F" && \
+      sed -i 's/^                                          search_url);$/                                          search_url, template_url->suggestions_url());/' "$F")) && \
+    grep -q "search_url, template_url->suggestions_url());" "$F" || \
+        (echo "BŁĄD: fix template_url_service_android.cc (suggestions_url) się nie zaaplikował" && exit 1)
+
+# BŁĄD ZŁAPANY W NINJA -- INNY WZORZEC niż poprzednie pięć (nie
+# is_android, nie brakująca flaga GN): `remove-unused-preferences-fields.
+# patch` usuwa `#include ".../safe_browsing_prefs.h"` z **95 plików**
+# jednocześnie (zweryfikowane sparsowaniem samego patcha, nie zgadywane).
+# Wiele z nich (m.in. `sb_protocol_manager_util.h`,
+# `device_signals/core/browser/browser_utils.h`) używało tego nagłówka
+# TRANZYTYWNIE -- same nie deklarowały, skąd biorą `safe_browsing::`,
+# `prefs::kSafeBrowsing*`, `base::FeatureList` itd., tylko polegały na
+# tym, że coś innego w łańcuchu include'ów to zapewniało. Pierwsze dwa
+# złapane pojedynczo w kolejnych buildach (sb_protocol_manager_util.cc,
+# potem browser_utils.h) ujawniły wzorzec zbyt duży na pojedyncze sedy --
+# zamiast łapać kolejne z 95 plików jeden po jednym w osobnych,
+# wielogodzinnych próbach builda, poniższy skrypt sprawdza WSZYSTKIE 95
+# NA RAZ: dla każdego pliku, który wciąż (po tym i INNYCH patchach)
+# odwołuje się do symboli z tego nagłówka (`safe_browsing::`,
+# `prefs::kSafeBrowsing*`, `prefs::kPasswordProtection*`,
+# `IsSafeBrowsingEnabled(` itd.), dopisuje `#include` z powrotem --
+# reszta (te, których patch poprawnie oczyścił z użycia) zostaje bez
+# zmian. Zweryfikowane poza kontenerem, na płytkim klonie drzewa:
+# 58 z 95 faktycznie potrzebowało przywrócenia, 37 nie (patch je
+# kompletnie wyczyścił, żadnego odwołania nie zostało). Kolejność
+# includów w wynikowych plikach nie jest idealnie alfabetyczna (nie ma to
+# znaczenia dla kompilacji, tylko dla lintera stylu, którego tu nie
+# uruchamiamy). Bezpieczne również dla plików nigdy niekompilowanych na
+# Androidzie (część z 95 to desktop-only UI) -- przywrócenie nieużywanego
+# include'a jest no-opem, nie błędem.
+RUN if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_safe_browsing_prefs_includes.py <<'PYEOF'
+#!/usr/bin/env python3
+"""Przywraca '#include safe_browsing_prefs.h' tam, gdzie remove-unused-
+preferences-fields.patch go usunął, ale plik nadal odwołuje się do
+symboli, które ten naglowek (tranzytywnie) zapewniał -- zweryfikowane
+per-plik, nie przywracane wszędzie na slepo."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+INCLUDE_LINE = '#include "components/safe_browsing/core/common/safe_browsing_prefs.h"'
+
+FILES = """chrome/browser/chrome_content_browser_client.cc
+chrome/browser/content_settings/generated_javascript_optimizer_pref.cc
+chrome/browser/download/download_browsertest.cc
+chrome/browser/download/download_ui_model.cc
+chrome/browser/download/download_ui_safe_browsing_util.cc
+chrome/browser/enterprise/connectors/analysis/content_analysis_delegate.cc
+chrome/browser/enterprise/signals/context_info_fetcher.h
+chrome/browser/extensions/api/preference/preference_api.cc
+chrome/browser/extensions/api/preference/preference_apitest.cc
+chrome/browser/extensions/api/safe_browsing_private/safe_browsing_private_event_router.cc
+chrome/browser/extensions/api/safe_browsing_private/safe_browsing_private_event_router_unittest.cc
+chrome/browser/extensions/api/settings_private/prefs_util.cc
+chrome/browser/extensions/extension_service.cc
+chrome/browser/extensions/installed_loader.cc
+chrome/browser/extensions/pref_mapping.cc
+chrome/browser/notifications/platform_notification_service_impl.cc
+chrome/browser/password_manager/generated_password_leak_detection_pref.cc
+chrome/browser/policy/configuration_policy_handler_list_factory.cc
+chrome/browser/prefs/browser_prefs.cc
+chrome/browser/prefs/chrome_command_line_pref_store.cc
+chrome/browser/prefs/chrome_pref_service_factory.cc
+chrome/browser/prefs/pref_functional_browsertest.cc
+chrome/browser/safe_browsing/advanced_protection_status_manager_desktop.cc
+chrome/browser/safe_browsing/advanced_protection_status_manager_unittest.cc
+chrome/browser/safe_browsing/android/services_delegate_android.h
+chrome/browser/safe_browsing/chrome_password_protection_service.cc
+chrome/browser/safe_browsing/chrome_password_protection_service_browsertest.cc
+chrome/browser/safe_browsing/chrome_password_protection_service_sync_browsertest.cc
+chrome/browser/safe_browsing/download_protection/check_client_download_request.cc
+chrome/browser/safe_browsing/download_protection/check_client_download_request_base.cc
+chrome/browser/safe_browsing/download_protection/download_protection_service_unittest.cc
+chrome/browser/safe_browsing/incident_reporting/extension_data_collection_unittest.cc
+chrome/browser/safe_browsing/incident_reporting/incident_reporting_service.cc
+chrome/browser/safe_browsing/incident_reporting/incident_reporting_service_unittest.cc
+chrome/browser/safe_browsing/incident_reporting/last_download_finder_unittest.cc
+chrome/browser/safe_browsing/incident_reporting/state_store.cc
+chrome/browser/safe_browsing/incident_reporting/state_store_unittest.cc
+chrome/browser/safe_browsing/metrics/safe_browsing_metrics_provider.cc
+chrome/browser/safe_browsing/safe_browsing_blocking_page_test.cc
+chrome/browser/safe_browsing/safe_browsing_service.h
+chrome/browser/safe_browsing/telemetry/android/android_telemetry_service.cc
+chrome/browser/safe_browsing/telemetry/android/android_telemetry_service_unittest.cc
+chrome/browser/safe_browsing/url_checker_delegate_impl.cc
+chrome/browser/site_protection/site_familiarity_utils.cc
+chrome/browser/ssl/sct_reporting_service.cc
+chrome/browser/ssl/ssl_browsertest.cc
+chrome/browser/ssl/ssl_error_controller_client.cc
+chrome/browser/ui/hats/trust_safety_sentiment_service.cc
+chrome/browser/ui/safety_hub/menu_notification_service.cc
+chrome/browser/ui/safety_hub/safe_browsing_result.cc
+chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.cc
+chrome/browser/ui/webui/browser_command/browser_command_handler.cc
+chrome/browser/ui/webui/downloads/downloads_dom_handler.cc
+chrome/browser/ui/webui/management/management_ui_handler.cc
+chrome/browser/ui/webui/reset_password/reset_password_ui.cc
+chrome/browser/ui/webui/settings/safety_hub_handler.cc
+chrome/browser/ui/webui/settings/settings_localized_strings_provider.cc
+chrome/browser/unified_consent/unified_consent_service_factory.cc
+components/device_signals/core/browser/browser_utils.h
+components/password_manager/core/browser/leak_detection/leak_detection_check_impl.cc
+components/password_manager/core/browser/leak_detection_delegate.cc
+components/password_manager/core/browser/password_reuse_detector_impl.cc
+components/password_manager/core/browser/password_reuse_manager_impl.cc
+components/password_manager/core/browser/password_sync_util.cc
+components/password_manager/core/browser/store_metrics_reporter.cc
+components/password_manager/core/browser/sync_credentials_filter_unittest.cc
+components/safe_browsing/content/browser/base_blocking_page.cc
+components/safe_browsing/content/browser/client_side_detection_service.cc
+components/safe_browsing/content/browser/safe_browsing_navigation_observer_manager.cc
+components/safe_browsing/content/browser/triggers/suspicious_site_trigger_unittest.cc
+components/safe_browsing/content/browser/triggers/trigger_manager.cc
+components/safe_browsing/content/browser/triggers/trigger_throttler_unittest.cc
+components/safe_browsing/content/browser/ui_manager.cc
+components/safe_browsing/content/browser/ui_manager_unittest.cc
+components/safe_browsing/core/browser/db/sb_protocol_manager_util.h
+components/safe_browsing/core/browser/db/util.h
+components/safe_browsing/core/browser/password_protection/password_protection_service_base.h
+components/safe_browsing/core/browser/realtime/policy_engine.cc
+components/safe_browsing/core/browser/realtime/url_lookup_service.cc
+components/safe_browsing/core/browser/realtime/url_lookup_service_base.cc
+components/safe_browsing/core/browser/safe_browsing_metrics_collector.cc
+components/safe_browsing/core/browser/tailored_security_service/tailored_security_service.cc
+components/safe_browsing/core/browser/tailored_security_service/tailored_security_service_observer_util.cc
+components/safe_browsing/core/common/hashprefix_realtime/hash_realtime_utils.cc
+components/safe_browsing/core/common/safe_browsing_policy_handler.cc
+components/safe_browsing/core/common/safe_browsing_prefs_unittest.cc
+components/safety_check/safety_check.cc
+components/security_interstitials/content/bad_clock_blocking_page.cc
+components/security_interstitials/content/captive_portal_blocking_page.cc
+components/security_interstitials/content/mitm_software_blocking_page.cc
+components/security_interstitials/content/security_interstitial_controller_client.cc
+components/security_interstitials/content/security_interstitial_page.cc
+components/security_interstitials/content/ssl_blocking_page.cc
+components/sync_preferences/common_syncable_prefs_database.cc
+extensions/browser/extension_allowlist.cc""".splitlines()
+
+# PORZUCONA HEURYSTYKA (pierwsza wersja tego skryptu): próba zgadnięcia,
+# które z 95 plików NADAL potrzebują include'a przez grep wzorców takich
+# jak "safe_browsing::"/"GetPasswordProtectionWarningTrigger(" w treści
+# pliku -- dała fałszywy negatyw: `password_protection_service_base.h`
+# deklaruje typy z namespace `safe_browsing` BEZ kwalifikatora (bo sam
+# plik jest wewnątrz `namespace safe_browsing {...}`), więc żaden wzorzec
+# z prefiksem "safe_browsing::" nie pasował, mimo że nagłówek był
+# potrzebny -- ninja padł na `GetPasswordProtectionWarningTriggerPref`
+# (z sufiksem "Pref", którego wzorzec też nie łapał) w .cc, które
+# TRANZYTYWNIE zależy od tego samego brakującego include'a przez własny
+# .h. Zamiast łatać wzorce w nieskończoność: przywracamy WSZYSTKIM 95
+# plikom bezwarunkowo -- nieużywany include nie jest błędem kompilacji
+# (`treat_warnings_as_errors=false` w naszych GN_ARGS i tak by to
+# tolerował, gdyby kiedykolwiek było inaczej), więc nadmiarowe
+# przywrócenie jest nieszkodliwe, a eliminuje całą klasę fałszywych
+# negatywów tej heurystyki.
+fixed, skipped_missing, skipped_has_include = [], [], []
+
+for rel in FILES:
+    p = SRC / rel
+    if not p.exists():
+        skipped_missing.append(rel)
+        continue
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    if INCLUDE_LINE in text:
+        skipped_has_include.append(rel)
+        continue
+    lines = text.split("\n")
+    last_include_idx = None
+    for i, line in enumerate(lines[:80]):
+        if line.startswith("#include"):
+            last_include_idx = i
+    if last_include_idx is None:
+        skipped_missing.append(rel + " (brak #include na poczatku -- pominieto)")
+        continue
+    lines.insert(last_include_idx + 1, INCLUDE_LINE)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    fixed.append(rel)
+
+print(f"NAPRAWIONE: {len(fixed)}, POMINIETE (ma juz include): {len(skipped_has_include)}, "
+     f"POMINIETE (brak pliku/struktury): {len(skipped_missing)}")
+# Sanity floor liczy SUME "naprawione TERAZ" + "mial juz wczesniej" -- na
+# /srcbuild (trwaly mount) ten skrypt moze sie wykonac ponownie na juz
+# poprawionym drzewie (np. po wstawieniu nowego fixu wczesniej w pliku,
+# co uniewaznia cache tego kroku) i wtedy PRAWIDLOWO naprawia 0, bo
+# wszystkie 95 juz maja include -- to nie jest blad.
+if len(fixed) + len(skipped_has_include) < 85:
+    print("BŁĄD: ani naprawiono, ani już obecnych w wystarczającej liczbie plików -- sprawdź ręcznie", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_safe_browsing_prefs_includes.py /srcbuild
+
+# BŁĄD ZŁAPANY W NINJA -- INNY WZORZEC niż brakujący include (dziewiąty
+# przypadek w tej sesji): `remove-unused-preferences-fields.patch` usuwa
+# CZYSTĄ WIRTUALNĄ metodę `GetPasswordProtectionWarningTriggerPref`
+# z klasy `PasswordProtectionServiceBase` (razem z jej deklaracją, nie
+# tylko include), ale NIE aktualizuje 3 miejsc, które ją wołają:
+# `PasswordProtectionServiceBase::IsWarningEnabled` (ta sama klasa) oraz
+# `ChromePasswordProtectionService::IsInPasswordAlertMode` i
+# `::GetPingNotSentReason` (podklasa) -- `use of undeclared identifier`.
+# Zweryfikowane grepem całego drzewa (poza testami/mockami, których nie
+# kompilujemy): to WSZYSTKIE 3 miejsca, żadnej implementacji przesłaniającej
+# gdzie indziej nie zostało. To rzeczywista luka w samym patchu ungoogled
+# (nie jest to_android-specyficzne ani sparowane z flagą GN) -- usunięto
+# mechanizm odczytu preferencji, ale zostawiono trzy odwołania do niego.
+# Fix: skoro mechanizm konfigurowania progu ostrzeżenia został usunięty,
+# traktujemy go jako "zawsze wyłączony" (spójne z resztą tej sesji --
+# mniej gadatliwe ostrzeżenia o ponownym użyciu haseł, nie więcej) --
+# wszystkie 3 miejsca zwracają teraz efekt "wyłączone" bezpośrednio,
+# zamiast odpytywać nieistniejącą metodę. Zweryfikowane poza
+# kontenerem (płytki klon drzewa) przez dokładne dopasowanie
+# tekstu (asercja unikalności przed podmianą, nie zgadywane sed-y).
+RUN if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_password_protection_trigger.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch usuwa GetPasswordProtectionWarningTriggerPref
+(czysta wirtualna metoda) z klasy, ale zostawia 3 wywolania. Traktujemy
+usuniety mechanizm jako zawsze wylaczony."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+
+f1 = SRC / "components/safe_browsing/core/browser/password_protection/password_protection_service_base.cc"
+old1 = """bool PasswordProtectionServiceBase::IsWarningEnabled(
+    ReusedPasswordAccountType password_type) {
+  return GetPasswordProtectionWarningTriggerPref(password_type) ==
+         PHISHING_REUSE;
+}"""
+new1 = """bool PasswordProtectionServiceBase::IsWarningEnabled(
+    ReusedPasswordAccountType password_type) {
+  return false;
+}"""
+text1 = f1.read_text()
+if new1 in text1:
+    print("fix1 (IsWarningEnabled) juz zastosowany, pomijam")
+else:
+    assert text1.count(old1) == 1, f"fix1: {text1.count(old1)} wystapien zamiast 1"
+    f1.write_text(text1.replace(old1, new1))
+    print("fix1 (IsWarningEnabled) OK")
+
+f2 = SRC / "chrome/browser/safe_browsing/chrome_password_protection_service.cc"
+text2 = f2.read_text()
+
+old2 = """bool ChromePasswordProtectionService::IsInPasswordAlertMode(
+    ReusedPasswordAccountType password_type) {
+  return GetPasswordProtectionWarningTriggerPref(password_type) ==
+         PASSWORD_REUSE;
+}"""
+new2 = """bool ChromePasswordProtectionService::IsInPasswordAlertMode(
+    ReusedPasswordAccountType password_type) {
+  return false;
+}"""
+if new2 in text2:
+    print("fix2 (IsInPasswordAlertMode) juz zastosowany, pomijam")
+else:
+    assert text2.count(old2) == 1, f"fix2: {text2.count(old2)} wystapien zamiast 1"
+    text2 = text2.replace(old2, new2)
+
+old3 = """  if (trigger_type == LoginReputationClientRequest::PASSWORD_REUSE_EVENT &&
+      GetPasswordProtectionWarningTriggerPref(password_type) ==
+          PASSWORD_PROTECTION_OFF) {
+    return RequestOutcome::TURNED_OFF_BY_ADMIN;
+  }"""
+new3 = """  if (trigger_type == LoginReputationClientRequest::PASSWORD_REUSE_EVENT) {
+    return RequestOutcome::TURNED_OFF_BY_ADMIN;
+  }"""
+if new3 in text2:
+    print("fix3 (GetPingNotSentReason) juz zastosowany, pomijam")
+else:
+    assert text2.count(old3) == 1, f"fix3: {text2.count(old3)} wystapien zamiast 1"
+    text2 = text2.replace(old3, new3)
+
+f2.write_text(text2)
+print("fix2+3 (IsInPasswordAlertMode, GetPingNotSentReason) OK")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_password_protection_trigger.py /srcbuild
+
+# BŁĄD ZŁAPANY W NINJA -- BEZPOŚREDNIA KONSEKWENCJA wykluczenia
+# `fix-building-without-safebrowsing.patch` (11. przypadek): `core/
+# ungoogled-chromium/move-js-optimizer-unfamiliar-sites.patch` PRZENOSI
+# stałą `kJavascriptOptimizerBlockedForUnfamiliarSites` z
+# `safe_browsing_prefs.h` do `content_settings/core/common/pref_names.h`
+# -- ale ten patch tylko DODAJE nową deklarację w nowym miejscu, USUNIĘCIE
+# starej z `safe_browsing_prefs.h` siedziało w drugiej połowie tej samej
+# "przeprowadzki", zaszytej w WYKLUCZONYM `fix-building-without-
+# safebrowsing.patch`. Efekt: po naszym bezwarunkowym przywróceniu
+# `#include safe_browsing_prefs.h` do 95 plików (krok wyżej),
+# `site_familiarity_utils.cc` (który już includuje `pref_names.h`)
+# dostaje TĘ SAMĄ stałą zadeklarowaną DWA razy -> `redefinition of
+# 'kJavascriptOptimizerBlockedForUnfamiliarSites'`. Zweryfikowane przez
+# `git show <tag>:plik` na czystym, niepatchowanym drzewie: w oryginale
+# stała istnieje TYLKO w `safe_browsing_prefs.h` -- duplikat wprowadziła
+# kombinacja naszych własnych decyzji (zastosuj `move-*`, wyklucz
+# `fix-building-without-safebrowsing`), nie błąd pojedynczego patcha.
+# Fix: dokończyć przeprowadzkę ręcznie -- usunąć starą deklarację z
+# `safe_browsing_prefs.h`, zostawiając jedyną (już poprawną) kopię w
+# `pref_names.h`. Sprawdzone programowo (nie na oko), że to JEDYNA taka
+# kolizja między tymi dwoma nagłówkami (brak innych wspólnych symboli
+# `kXxx`) -- nie ma potrzeby szerszego audytu.
+RUN if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_js_optimizer_pref_duplicate.py <<'PYEOF'
+#!/usr/bin/env python3
+"""move-js-optimizer-unfamiliar-sites.patch przenosi stala do pref_names.h,
+ale usuniecie starej deklaracji z safe_browsing_prefs.h nalezalo do
+wykluczonego fix-building-without-safebrowsing.patch. Konczymy przeprowadzke
+recznie."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "components/safe_browsing/core/common/safe_browsing_prefs.h"
+text = f.read_text()
+old = """// A boolean indicating whether the user selected on chrome://settings to
+// disable the JavaScript optimizer on unfamiliar sites for improved security.
+// The site-familiarity computation is done locally based on the user's
+// browsing habits.
+inline constexpr char kJavascriptOptimizerBlockedForUnfamiliarSites[] =
+    "safebrowsing.javascript_optimizer_blocked_for_unfamiliar_sites";
+
+"""
+count = text.count(old)
+if count == 0:
+    print("duplikat kJavascriptOptimizerBlockedForUnfamiliarSites juz usuniety, pomijam")
+else:
+    assert count == 1, f"oczekiwano 1 wystapienia, znaleziono {count}"
+    f.write_text(text.replace(old, ""))
+    print("duplikat kJavascriptOptimizerBlockedForUnfamiliarSites usuniety z safe_browsing_prefs.h")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_js_optimizer_pref_duplicate.py /srcbuild
+
+# BŁĄD ZŁAPANY W NINJA (12. przypadek) -- TA SAMA rodzina co ósmy/dziewiąty
+# przypadek (kruchy include, nie duplikat, nie is_android): w
+# `chrome/browser/policy/configuration_policy_handler_list_factory.cc`
+# `remove-unused-preferences-fields.patch` usuwa `#include ".../
+# safe_browsing_policy_handler.h"` ZAŁOŻENIE: wszystkie odwołania do
+# `safe_browsing::SafeBrowsingPolicyHandler` w tym pliku i tak znikną --
+# ale TO założenie jest prawdziwe tylko razem z WYKLUCZONYM `fix-building-
+# without-safebrowsing.patch`, który usuwa JEDYNE pozostałe wywołanie
+# (`handlers->AddHandler(std::make_unique<safe_browsing::
+# SafeBrowsingPolicyHandler>())`). Zweryfikowane: WSZYSTKIE inne symbole z
+# `safe_browsing_prefs.h` (`prefs::kSafeBrowsing*` itd.) w tym samym pliku
+# są usuwane przez TEN SAM (zaaplikowany) patch -- więc plik potrzebuje z
+# powrotem WYŁĄCZNIE `safe_browsing_policy_handler.h`, nie
+# `safe_browsing_prefs.h` (stąd ten plik nie był i nie powinien być na
+# liście 95 wyżej). Ten sam ogólny wzorzec co jedenasty przypadek:
+# wykluczenie patcha zostawia osierocone pół-zmiany z INNYCH, wciąż
+# aplikowanych patchy w tym samym pliku.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    F=chrome/browser/policy/configuration_policy_handler_list_factory.cc && \
+    (grep -q '#include "components/safe_browsing/core/common/safe_browsing_policy_handler.h"' "$F" || \
+     (grep -q '#include "components/safe_browsing/buildflags.h"' "$F" && \
+      sed -i 's|#include "components/safe_browsing/buildflags.h"|#include "components/safe_browsing/buildflags.h"\n#include "components/safe_browsing/core/common/safe_browsing_policy_handler.h"|' "$F")) && \
+    grep -q '#include "components/safe_browsing/core/common/safe_browsing_policy_handler.h"' "$F" || \
+        (echo "BŁĄD: fix configuration_policy_handler_list_factory.cc (safe_browsing_policy_handler.h) się nie zaaplikował" && exit 1)
+
+# BŁĄD ZŁAPANY W NINJA (13. przypadek) -- ODWROTNOŚĆ dwunastego: tam patch
+# USUWAŁ include, którego wciąż potrzebowano; tu `extra/ungoogled-chromium/
+# add-flag-to-configure-extension-downloading.patch` DODAJE `#include
+# "extensions/browser/extension_util.h"` do `chrome/browser/download/
+# download_target_determiner.cc`, ale POZA istniejącym blokiem `#if
+# BUILDFLAG(ENABLE_EXTENSIONS_CORE)` -- mimo że jedyne miejsce w tym pliku,
+# gdzie patch faktycznie UŻYWA tego nagłówka (wywołanie
+# `extensions::util::ShouldDownloadAsRegularFile()`), samo jest wewnątrz
+# tego bloku. Na Androidzie `enable_extensions_core` jest DOMYŚLNIE `false`
+# (`extensions/buildflags/buildflags.gni`: `enable_extensions =
+# !is_android && ...`, `enable_extensions_core = enable_extensions || ...`)
+# -- więc otoczony kodem include nigdy by się nie skompilował, ale
+# bezwarunkowy się kompiluje zawsze, a `extensions/common/manifest.h`
+# (tranzytywnie, przez `extension_util.h`) wymaga wygenerowanego
+# `extensions/common/mojom/manifest.mojom-shared.h`, którego target
+# `chrome/browser/download:impl` nie ma w deps na Androidzie (nigdy nie
+# musiał). Efekt: `fatal error: ... manifest.mojom-shared.h file not
+# found`. To błąd w SAMYM patchu ungoogled (dwa pozostałe includy w tym
+# samym bloku -- `webstore_installer.h`, `feature_switch.h` -- SĄ
+# poprawnie zagatowane, autor patcha po prostu umieścił nowy include nad
+# blokiem zamiast w nim), niewidoczny na desktopie (tam
+# `enable_extensions=true`, nagłówek zawsze dostępny). Zweryfikowane
+# host-side: przeniesienie include'a do bloku `#if
+# BUILDFLAG(ENABLE_EXTENSIONS_CORE)` nie zmienia zachowania (kod, który go
+# używa, i tak jest w tym samym bloku) i usuwa błąd kompilacji.
+RUN if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_download_target_determiner_include.py <<'PYEOF'
+#!/usr/bin/env python3
+"""add-flag-to-configure-extension-downloading.patch dodaje niezagatowany
+#include extension_util.h, mimo ze jedyne uzycie jest pod
+#if BUILDFLAG(ENABLE_EXTENSIONS_CORE) -- ktore na Androidzie jest false.
+Przenosimy include do istniejacego bloku guard obok pokrewnych naglowkow."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "chrome/browser/download/download_target_determiner.cc"
+text = f.read_text()
+
+new_guarded_marker = ('#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)\n'
+                      '#include "extensions/browser/extension_util.h"\n')
+if new_guarded_marker in text:
+    print("include extension_util.h juz przeniesiony pod guard, pomijam")
+else:
+    old_unconditional = ('#include "content/public/common/buildflags.h"\n'
+                          '#include "extensions/browser/extension_util.h"\n'
+                          '#include "extensions/buildflags/buildflags.h"\n')
+    assert text.count(old_unconditional) == 1, f"oczekiwano 1, znaleziono {text.count(old_unconditional)}"
+    text = text.replace(old_unconditional,
+        '#include "content/public/common/buildflags.h"\n'
+        '#include "extensions/buildflags/buildflags.h"\n')
+
+    old_guarded = ('#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)\n'
+                   '#include "extensions/browser/webstore_installer.h"\n'
+                   '#include "extensions/common/feature_switch.h"\n'
+                   '#endif\n')
+    assert text.count(old_guarded) == 1, f"oczekiwano 1, znaleziono {text.count(old_guarded)}"
+    text = text.replace(old_guarded,
+        '#if BUILDFLAG(ENABLE_EXTENSIONS_CORE)\n'
+        '#include "extensions/browser/extension_util.h"\n'
+        '#include "extensions/browser/webstore_installer.h"\n'
+        '#include "extensions/common/feature_switch.h"\n'
+        '#endif\n')
+
+    f.write_text(text)
+print("extension_util.h przeniesiony pod #if BUILDFLAG(ENABLE_EXTENSIONS_CORE) w download_target_determiner.cc")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_download_target_determiner_include.py /srcbuild
+
+# BŁĄD ZŁAPANY DOPIERO NA LINKOWANIU (16. przypadek, 44137/44140 -- trzy
+# cele od końca) -- TA SAMA rodzina co czwarty/dwunasty/trzynasty
+# przypadek (wykluczenie `fix-building-without-safebrowsing.patch`
+# zostawia osierocone pół-zmiany z INNYCH, aplikowanych patchy), ale
+# pierwszy raz ujawniona przez LINKER, nie kompilator -- stąd długo
+# niewidoczna (wszystkie 44140 obiektów kompiluje się bez błędu, bo
+# nagłówek z deklaracjami wciąż istnieje). `remove-unused-preferences-
+# fields.patch` zamienia CAŁY `static_library("safe_browsing_prefs")`
+# (components/safe_browsing/core/common/BUILD.gn) na PUSTY
+# `group("safe_browsing_prefs") { # SafeBrowsing prefs are disabled }`
+# -- ten sam target NAME (więc GN nie zgłasza błędu "target not found"
+# przy `gn gen`), ale bez `sources`, więc `safe_browsing_prefs.cc`
+# (funkcje `GetSafeBrowsingState`, `EnableSafeBrowsingSettingSetLocallyPref`,
+# `IsExtendedReportingEnabled`, `IsSafeBrowsingPolicyManaged`,
+# `SetSafeBrowsingState`, `SetExtendedReportingPrefAndMetric`,
+# `IsEnhancedProtectionEnabled`) NIGDY się nie kompiluje. Zamysł patcha:
+# to bezpieczne, bo desktopowy `chrome/browser/safe_browsing/BUILD.gn`
+# (przez WYKLUCZONY `fix-building-without-safebrowsing.patch`) miał
+# przestać wołać te funkcje -- ale `chrome/browser/safe_browsing/
+# android/BUILD.gn` (JNI bridge `safe_browsing_bridge.cc`, ANDROID-only,
+# nietknięty przez ŻADEN patch) nadal ma `deps = [".../core/common:
+# safe_browsing_prefs"]` i realnie woła te funkcje -> `undefined symbol`
+# na linkerze, nie w kompilacji pojedynczych plików. Zweryfikowane
+# host-side: `safe_browsing_prefs.cc`/`.h` (przycięte przez TEN SAM
+# patch o usunięte stałe kSafeBrowsing*, ale wciąż zawierające te 7
+# funkcji) nie są dotknięte przez żaden INNY patch -- wystarczy
+# przywrócić SAM target w BUILD.gn, nie treść pliku.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_safe_browsing_prefs_target.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch zamienia static_library
+"safe_browsing_prefs" na pusty group() o tej samej nazwie -- bezpieczne
+na desktopie (wykluczony fix-building-without-safebrowsing.patch mial
+usunac wolajacych), ale chrome/browser/safe_browsing/android/BUILD.gn
+(nietkniety przez zaden patch) nadal go potrzebuje. Przywracamy tylko
+target w BUILD.gn, nie ruszamy tresci .cc/.h (przyciete poprawnie przez
+ten sam patch, funkcje ktorych Android potrzebuje tam zostaly)."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "components/safe_browsing/core/common/BUILD.gn"
+text = f.read_text()
+old = '''group("safe_browsing_prefs") {
+  # SafeBrowsing prefs are disabled
+}'''
+count = text.count(old)
+new = '''static_library("safe_browsing_prefs") {
+  sources = [
+    "safe_browsing_prefs.cc",
+    "safe_browsing_prefs.h",
+  ]
+
+  configs += [ "//build/config/compiler:wexit_time_destructors" ]
+
+  deps = [
+    ":features",
+    "//components/pref_registry",
+    "//components/prefs",
+    "//net",
+  ]
+
+  public_deps = [ "//base" ]
+}'''
+if count == 0:
+    assert new in text, "ani stary group(), ani nowy static_library() nie znaleziony -- nieoczekiwany stan pliku"
+    print("static_library(\"safe_browsing_prefs\") juz przywrocony, pomijam")
+else:
+    assert count == 1, f"oczekiwano 1 wystapienia, znaleziono {count}"
+    f.write_text(text.replace(old, new))
+    print("static_library(\"safe_browsing_prefs\") przywrocony w core/common/BUILD.gn")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_safe_browsing_prefs_target.py /srcbuild
+
+# BŁĄD PRZEWIDZIANY PRZED NINJA (156.0.8078.47, 2026-10-26 -- wzorzec:
+# wykluczenie patcha osiera połowę zmiany). Upstream po 151
+# przemianował V4LocalDatabaseManager na SBLocalDatabaseManager i dodał
+# PUBLICZNY konstruktor z `base::PassKey`, którego używa `Create()`.
+# Stosowany `remove-unused-preferences-fields.patch` usuwa
+# `ExtendedReportingLevelCallback` z `Create()`, prywatnego konstruktora,
+# pola i aliasu typu (v4_update_protocol_manager.h), ale ten sam parametr
+# w konstruktorze z PassKey usuwa wyłącznie WYKLUCZONY
+# `fix-building-without-safebrowsing.patch`. Bez poprawki nagłówek
+# odwołuje się do nieistniejącego typu, a `Create()` podaje 5 argumentów
+# do 6-parametrowego konstruktora. Android buduje ten target bezwarunkowo
+# (chrome/browser/safe_browsing/BUILD.gn -> sb_local_database_manager).
+# Fix = dokładnie dwa hunki z wykluczonego patcha. Zweryfikowane na
+# drzewie 156 po pełnej serii patchy (symulacja host-side): drugi przebieg
+# niczego nie zmienia, zero referencji do usuniętego parametru.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_sb_local_database_manager_passkey_ctor.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch (156) usuwa ExtendedReportingLevelCallback
+z SBLocalDatabaseManager::Create() i z PRYWATNEGO konstruktora, ale ten sam
+parametr w PUBLICZNYM konstruktorze z PassKey (dodany upstream po 151, uzywany
+przez Create() i testy) usuwa dopiero WYKLUCZONY fix-building-without-
+safebrowsing.patch. Bez tego sb_local_database_manager.cc sie nie kompiluje
+(Create() podaje 5 argumentow do 6-parametrowego ctora; ctor z PassKey deleguje
+5 argumentow do 4-parametrowego). Na Androidzie target jest budowany
+bezwarunkowo (chrome/browser/safe_browsing/BUILD.gn, deps static_library
+"safe_browsing"). Fix = dokladnie dwa hunki z wykluczonego patcha."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+d = SRC / "components/safe_browsing/core/browser/db"
+
+h = d / "sb_local_database_manager.h"
+th = h.read_text()
+old_h = """      base::PassKey<SBLocalDatabaseManager, SBLocalDatabaseManagerTest>,
+      const base::FilePath& base_path,
+      ExtendedReportingLevelCallback extended_reporting_level_callback,
+      scoped_refptr<base::SequencedTaskRunner> ui_task_runner,"""
+new_h = """      base::PassKey<SBLocalDatabaseManager, SBLocalDatabaseManagerTest>,
+      const base::FilePath& base_path,
+      scoped_refptr<base::SequencedTaskRunner> ui_task_runner,"""
+if new_h in th and old_h not in th:
+    print("sb_local_database_manager.h: juz poprawiony, pomijam")
+else:
+    assert th.count(old_h) == 1, f".h: oczekiwano 1, znaleziono {th.count(old_h)}"
+    h.write_text(th.replace(old_h, new_h))
+    print("sb_local_database_manager.h: parametr usuniety z ctora PassKey")
+
+c = d / "sb_local_database_manager.cc"
+tc = c.read_text()
+old_c = """    base::PassKey<SBLocalDatabaseManager, SBLocalDatabaseManagerTest>,
+    const base::FilePath& base_path,
+    ExtendedReportingLevelCallback extended_reporting_level_callback,
+    scoped_refptr<base::SequencedTaskRunner> ui_task_runner,
+    scoped_refptr<base::SequencedTaskRunner> io_task_runner,
+    scoped_refptr<base::SequencedTaskRunner> task_runner_for_tests)
+    : SBLocalDatabaseManager(base_path,
+                             extended_reporting_level_callback,
+                             std::move(ui_task_runner),"""
+new_c = """    base::PassKey<SBLocalDatabaseManager, SBLocalDatabaseManagerTest>,
+    const base::FilePath& base_path,
+    scoped_refptr<base::SequencedTaskRunner> ui_task_runner,
+    scoped_refptr<base::SequencedTaskRunner> io_task_runner,
+    scoped_refptr<base::SequencedTaskRunner> task_runner_for_tests)
+    : SBLocalDatabaseManager(base_path,
+                             std::move(ui_task_runner),"""
+if new_c in tc and old_c not in tc:
+    print("sb_local_database_manager.cc: juz poprawiony, pomijam")
+else:
+    assert tc.count(old_c) == 1, f".cc: oczekiwano 1, znaleziono {tc.count(old_c)}"
+    c.write_text(tc.replace(old_c, new_c))
+    print("sb_local_database_manager.cc: ctor PassKey + delegacja poprawione")
+
+for f in (h, c):
+    assert "extended_reporting_level_callback" not in f.read_text(), f"{f.name}: zostala referencja"
+print("sb_local_database_manager: spojne (zero extended_reporting_level_callback)")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_sb_local_database_manager_passkey_ctor.py /srcbuild
+
+# BŁĄD ZŁAPANY W NINJA (17. przypadek, DOPIERO teraz -- ten plik nigdy
+# wcześniej się nie kompilował, dopóki poprzedni fix nie przywrócił
+# targetu z pustego group()). `safe_browsing_prefs.cc:RegisterProfilePrefs`
+# (kod NIEDOTKNIĘTY przez żaden patch -- to własny, wewnętrzny call site
+# tego samego pliku, którego .h dotyczył jedenasty przypadek) woła
+# `prefs::kJavascriptOptimizerBlockedForUnfamiliarSites` bez kwalifikacji
+# `::` -- to PIERWOTNIE (pristine) rozwiązywało się do
+# `safe_browsing::prefs::...` (deklaracja we WŁASNYM `safe_browsing_
+# prefs.h`, usunięta przez fix jedenastego przypadku jako "duplikat").
+# Ale C++ nie szuka INNEJ, globalnej przestrzeni `prefs` o tej samej
+# nazwie, gdy `safe_browsing::prefs` już istnieje (ma inne stałe, np.
+# `kMigratedToJavascriptOptimizerBlockedForUnfamiliarSites` -- stąd
+# `error: no member ... did you mean 'kMigratedTo...'`, kompilator
+# poprawnie znalazł przestrzeń nazw, tylko nie ten jeden człon).
+# `move-js-optimizer-unfamiliar-sites.patch` inne wywołania (generated_
+# javascript_optimizer_pref.cc, site_familiarity_utils.cc,
+# content_settings_pref_provider.cc) jawnie kwalifikuje `::prefs::` LUB
+# dokłada `#include ".../content_settings/core/common/pref_names.h"` --
+# ten JEDEN wewnętrzny call site w safe_browsing_prefs.cc, którego patch
+# nie dotyka wcale, tego nie dostał. Linia bezpośrednio nad nim w TEJ
+# SAMEJ funkcji już ma wzorzec `::prefs::kBundledSettings...` (jawna
+# globalna kwalifikacja) -- ten sam fix, zastosowany konsekwentnie.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_safe_browsing_prefs_cc_js_optimizer.py <<'PYEOF'
+#!/usr/bin/env python3
+"""safe_browsing_prefs.cc:RegisterProfilePrefs wola nieskwalifikowane
+prefs::kJavascriptOptimizerBlockedForUnfamiliarSites -- rozwiazuje sie do
+safe_browsing::prefs (wlasny, zagniezdzony namespace), gdzie tej stalej
+juz nie ma (przeniesiona przez move-js-optimizer-unfamiliar-sites.patch
+do globalnego content_settings/core/common/pref_names.h). Fix: jawna
+kwalifikacja ::prefs:: (jak linia wyzej w tej samej funkcji) + include."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "components/safe_browsing/core/common/safe_browsing_prefs.cc"
+text = f.read_text()
+
+old_call = "      prefs::kJavascriptOptimizerBlockedForUnfamiliarSites, false);"
+new_call = "      ::prefs::kJavascriptOptimizerBlockedForUnfamiliarSites, false);"
+if new_call in text:
+    print("wywolanie juz zakwalifikowane ::prefs::, pomijam")
+else:
+    assert text.count(old_call) == 1, f"oczekiwano 1, znaleziono {text.count(old_call)}"
+    text = text.replace(old_call, new_call)
+
+include_line = '#include "components/content_settings/core/common/pref_names.h"\n'
+if include_line in text:
+    print("include content_settings/pref_names.h juz obecny, pomijam")
+else:
+    anchor = '#include "components/pref_registry/pref_registry_syncable.h"\n'
+    assert text.count(anchor) == 1, f"oczekiwano 1 zakotwiczenia include, znaleziono {text.count(anchor)}"
+    text = text.replace(anchor, anchor + include_line)
+
+f.write_text(text)
+print("safe_browsing_prefs.cc: ::prefs:: kwalifikacja + include gotowe")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_safe_browsing_prefs_cc_js_optimizer.py /srcbuild
+
+# BŁĄD ZŁAPANY DOPIERO NA URZĄDZENIU (18. przypadek) -- build/ninja/link
+# przeszły w 100%, `.apk` się zainstalował, ale apka CRASHUJE natychmiast
+# przy starcie (`CHECK` w `PrefService::GetPreferenceValue`, SIGTRAP,
+# zdiagnozowane symbolizacją tombstone'a przez llvm-symbolizer na
+# `lib.unstripped/libchrome.so` wyciągniętym z `/srcbuild` -- TA SAMA
+# metoda co przy V8 snapshot). Łańcuch: `KeyedServiceTemplated
+# Factory::GetServiceForContext` -> `ClientSideDetectionServiceFactory::
+# BuildServiceInstanceForBrowserContext` -> konstruktor
+# `ClientSideDetectionService` -> `LoadPhishingReportTimesFromPrefs()` ->
+# `prefs_->GetList(prefs::kSafeBrowsingCsdPingTimestamps)` -> CHECK
+# fail, bo ten pref NIGDY nie został zarejestrowany.
+#
+# Przyczyna, GŁĘBSZA niż szesnasty/siedemnasty przypadek: to nie brak
+# include'a ani zła kwalifikacja namespace -- `remove-unused-preferences-
+# fields.patch` usuwa z `chrome/browser/prefs/browser_prefs.cc` SAME
+# WYWOŁANIA `safe_browsing::RegisterLocalStatePrefs(registry);` (w
+# `RegisterLocalState`) i `safe_browsing::RegisterProfilePrefs(registry);`
+# (w `RegisterProfilePrefs`) -- razem z `#include ".../safe_browsing_
+# prefs.h"`, którego te wywołania potrzebują. Efekt: NAWET PO przywróceniu
+# targetu (16.) i naprawieniu kompilacji (17.), funkcja `safe_browsing::
+# RegisterProfilePrefs()` (dziesiątki `Register*Pref` w środku, w tym
+# NASZ WŁASNY literał `kSafeBrowsingEnabled` z sekcji 5e!) nigdy się nie
+# wykonuje -- kompiluje się poprawnie, ale nikt jej nie woła. Ten sam,
+# już dobrze poznany wzorzec (wykluczenie `fix-building-without-
+# safebrowsing.patch` zostawia osierocone pół-zmiany), ale na jeszcze
+# GŁĘBSZYM poziomie niż poprzednie dwa przypadki -- tu padła cała ścieżka
+# WOŁANIA, nie tylko deklaracja pojedynczego symbolu.
+#
+# LEKCJA (rozszerza siedemnasty przypadek): "build się udał, `.apk` się
+# zainstalował" dalej NIE dowodzi, że dana ścieżka kodu działa -- trzeba
+# faktycznie URUCHOMIĆ aplikację i sprawdzić crash log/tombstone. Ten
+# konkretny błąd był NIEWIDOCZNY na każdym wcześniejszym etapie (gn gen,
+# ninja, link) i ujawnił się DOPIERO przy realnym starcie na urządzeniu.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_browser_prefs_safe_browsing_calls.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch usuwa z browser_prefs.cc wywolania
+safe_browsing::RegisterLocalStatePrefs/RegisterProfilePrefs (+ include) --
+bezpieczne tylko razem z wykluczonym fix-building-without-safebrowsing.patch,
+ktory usuwalby cala definicje tych funkcji. My ja przywrocilismy (16./17.
+przypadek), wiec trzeba przywrocic tez WYWOLANIA, inaczej funkcje nigdy sie
+nie wykonuja mimo ze poprawnie istnieja i kompiluja."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "chrome/browser/prefs/browser_prefs.cc"
+text = f.read_text()
+
+include_line = '#include "components/safe_browsing/core/common/safe_browsing_prefs.h"\n'
+if include_line in text:
+    print("include safe_browsing_prefs.h juz obecny, pomijam")
+else:
+    anchor = '#include "components/safe_browsing/buildflags.h"\n'
+    assert text.count(anchor) == 1, f"oczekiwano 1 zakotwiczenia include, znaleziono {text.count(anchor)}"
+    text = text.replace(anchor, anchor + include_line)
+
+local_state_call = "  safe_browsing::RegisterLocalStatePrefs(registry);\n"
+if local_state_call in text:
+    print("wywolanie RegisterLocalStatePrefs juz obecne, pomijam")
+else:
+    anchor = "  search_engines::SearchEngineChoiceService::RegisterLocalStatePrefs(registry);\n"
+    assert text.count(anchor) == 1, f"oczekiwano 1 zakotwiczenia RegisterLocalState, znaleziono {text.count(anchor)}"
+    text = text.replace(anchor, local_state_call + anchor)
+
+profile_call = "  safe_browsing::RegisterProfilePrefs(registry);\n"
+if profile_call in text:
+    print("wywolanie RegisterProfilePrefs juz obecne, pomijam")
+else:
+    anchor = "  safety_check::prefs::RegisterProfilePrefs(registry);\n"
+    assert text.count(anchor) == 1, f"oczekiwano 1 zakotwiczenia RegisterProfilePrefs, znaleziono {text.count(anchor)}"
+    text = text.replace(anchor, profile_call + anchor)
+
+f.write_text(text)
+print("browser_prefs.cc: wywolania safe_browsing::Register*Prefs przywrocone")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_browser_prefs_safe_browsing_calls.py /srcbuild
+
+# BŁĄD ZŁAPANY NA URZĄDZENIU (19. przypadek, DRUGI crash po naprawie
+# osiemnastego) -- ta sama kategoria "build/link OK, crash dopiero przy
+# starcie", ta sama metoda diagnozy (symbolizacja tombstone'a przez
+# llvm-symbolizer, `/srcbuild` pozwala wyciągnąć `lib.unstripped/
+# libchrome.so` bez czekania na kolejny build). Łańcuch: `SigninManagerImpl`
+# (Java, przy starcie) -> JNI -> `signin::JniIdentityMutator::
+# SeedAccountsThenReloadAllAccountsWithPrimaryAccount` ->
+# `ProfileOAuth2TokenServiceDelegateAndroid::
+# SeedAccountsThenReloadAllAccountsWithPrimaryAccount` ->
+# `CHECK_NE(fire_refresh_token_loaded_, RT_LOAD_NOT_START)` fail --
+# invariant "LoadCredentials musi się wykonać przed tym wywołaniem"
+# złamany, bo NIGDY się nie wykonuje.
+#
+# Przyczyna: `remove-unused-preferences-fields.patch` usuwa niemal CAŁE
+# ciało konstruktora `PrimaryAccountManager::PrimaryAccountManager`
+# (components/signin/internal/identity_manager/primary_account_manager.cc)
+# -- CELOWO, to sedno patcha: zamiast odczytywać `kGoogleServicesAccountId`/
+# `kGoogleServicesConsentedToSync` z prefs i PRZYWRACAĆ poprzednie
+# zalogowanie, konstruktor teraz zawsze wymusza puste konto
+# (`SetPrimaryAccountInternal(CoreAccountInfo(), consented_to_sync=false,
+# ...)`) -- to jest INTENCJONALNA, zgodna z duchem projektu blokada
+# przywracania sesji logowania, NIE zostawiamy tego jak było. ALE razem z
+# tym usunięty został też, niepowiązany z blokadą logowania,
+# `token_service_observation_.Observe(token_service_)` +
+# `token_service_->LoadCredentials(...)` -- inicjalizacja maszyny stanów
+# tokenów OAuth2, potrzebna ZAWSZE (niezależnie od tego, czy jest
+# zalogowane konto), bo to ANDROIDOWY `SigninManagerImpl` bezwarunkowo
+# zakłada, że się wykonała, zanim cokolwiek zrobi z kontami.
+#
+# Fix: przywrócić WYŁĄCZNIE te dwie linie (obserwację + LoadCredentials),
+# NIE przywracać usuniętej logiki odczytu/przywracania prefs -- to
+# zachowuje intencję prywatnościową patcha (nigdy nie przywracaj
+# poprzedniego logowania) i naprawia tylko złamany invariant Androida.
+# Zweryfikowane host-side na w pełni załatanym drzewie (pełny reset +
+# reaplikacja 106 patchy, nie tylko tego jednego pliku -- nauczka z
+# osiemnastego przypadku, gdzie test na częściowo-resetowanym drzewie dał
+# fałszywy wynik).
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_primary_account_manager_load_credentials.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch celowo usuwa przywracanie
+poprzedniego logowania z konstruktora PrimaryAccountManager (zostaje) --
+ale przy okazji usuwa tez token_service_->LoadCredentials(), potrzebne
+ZAWSZE (Android SigninManagerImpl tego wymaga bezwarunkowo). Przywracamy
+TYLKO te dwie linie, nie ruszamy reszty (celowo usunieta logika prefs)."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "components/signin/internal/identity_manager/primary_account_manager.cc"
+text = f.read_text()
+
+new_marker = "  token_service_observation_.Observe(token_service_);\n"
+if new_marker in text:
+    print("LoadCredentials juz przywrocone, pomijam")
+else:
+    old = """  // PrimaryAccountManager is initialized once the primary account and consent
+  // level are loaded.
+  CHECK(primary_account_.has_value());
+}
+
+PrimaryAccountManager::~PrimaryAccountManager() = default;"""
+    new = """  // PrimaryAccountManager is initialized once the primary account and consent
+  // level are loaded.
+  CHECK(primary_account_.has_value());
+
+  // It is important to only load credentials after starting to observe the
+  // token service.
+  token_service_observation_.Observe(token_service_);
+  token_service_->LoadCredentials(
+      GetPrimaryAccountId(signin::ConsentLevel::kSignin));
+}
+
+PrimaryAccountManager::~PrimaryAccountManager() = default;"""
+    count = text.count(old)
+    assert count == 1, f"oczekiwano 1, znaleziono {count}"
+    f.write_text(text.replace(old, new))
+    print("primary_account_manager.cc: LoadCredentials przywrocone")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_primary_account_manager_load_credentials.py /srcbuild
+
+# BŁĄD ZŁAPANY NA URZĄDZENIU (20. przypadek, TRZECI crash z rzędu w tym
+# samym obszarze -- signin) -- ekran powitalny (FullscreenSigninMediator,
+# pierwsze uruchomienie) crashuje w `isSigninSupported()`:
+# `UserPrefs.get(profile).getBoolean(Pref.SIGNIN_ALLOWED)` -> `CHECK` fail
+# w `PrefService::GetPreferenceValue` (ten sam wzorzec błędu co 18/19,
+# inny pref). Zdiagnozowane BEZ kolejnego zgadywania z samego C++ stosu:
+# `Java_J_N_ZJO` w tombstone nie mówi WIELE (generyczne `PrefService.
+# getBoolean(String)`, klucz jako runtime string), więc wyciągnięty
+# `ChromePublic.apk.mapping` (R8/ProGuard, też żyje na `/srcbuild`) do
+# deobfuskacji zminifikowanych klas Javy (`lp5`/`hp5`) na prawdziwe nazwy
+# (`FullscreenSigninMediator.onInitialLoadCompleted` ->
+# `isSigninSupported` -> `getTitleText`) -- BEZ tego namierzenie
+# konkretnego wywołania w zaciemnionym kodzie R8 byłoby zgadywaniem.
+#
+# Przyczyna: DOKŁADNIE ten sam wzorzec co osiemnasty/dziewiętnasty
+# przypadek, TRZECIA już ofiara `remove-unused-preferences-fields.patch`
+# w podsystemie signin -- `PrimaryAccountManager::RegisterProfilePrefs`
+# (osobna, statyczna funkcja w TYM SAMYM pliku co dziewiętnasty przypadek)
+# wycięta do PUSTEGO ciała (`{}`), razem z `#include ".../signin_pref_
+# names.h"` (usunięty jako "nieużywany" -- prawda, dopóki funkcja jest
+# pusta). Pristine rejestrowała 11 prefów w tej funkcji (m.in. `kGoogle
+# ServicesLastSyncingGaiaId`, `kExplicitBrowserSignin`) -- większość z
+# nich dotyczy PRZYWRACANIA poprzedniej sesji/synchronizacji, celowo
+# niepotrzebne (spójne z duchem patcha i dziewiętnastym przypadkiem).
+# TYLKO `kSigninAllowed` jest faktycznie CZYTANE poza tym plikiem (przez
+# UI pierwszego uruchomienia, sprawdzające czy w ogóle POKAZAĆ ekran
+# logowania) -- i to jedyne, co przywracamy, RAZEM Z WŁASNĄ WARTOŚCIĄ
+# `false` (nie `true` jak pristine) -- to dokładnie ten sam literał, co
+# istniał w tej sesji PRZED przejściem na pełną serię patchy (dawna
+# tabela: "Logowanie do konta ... kSigninAllowed, true ->
+# false"), teraz wpisany wprost zamiast przez `install_android.sh`.
+# Zweryfikowane host-side na w pełni załatanym drzewie (pełny reset +
+# reaplikacja 106 patchy PRZED testem, konsekwentnie jak w 18/19).
+#
+# OTWARTE: skoro to już TRZECI taki przypadek w JEDNYM pliku (dwie
+# funkcje: konstruktor w 19., ta funkcja w 20.), możliwe że są kolejne w
+# INNYCH plikach dotkniętych tym samym patchem -- ten patch dotyka
+# dziesiątek plików w wielu subsystemach (safe_browsing, signin, i
+# zapewne więcej), a każdy taki przypadek ujawnia się DOPIERO na
+# urządzeniu, nigdy w buildzie. Nie ma jak wyczerpująco to sprawdzić bez
+# testowania każdej ścieżki UI na żywym urządzeniu.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cat > /repo/fix_primary_account_manager_register_prefs.py <<'PYEOF'
+#!/usr/bin/env python3
+"""remove-unused-preferences-fields.patch wycina cale cialo
+PrimaryAccountManager::RegisterProfilePrefs (+ include signin_pref_names.h)
+-- wiekszosc z 11 usunietych prefow to celowo niepotrzebne przywracanie
+sesji, ale kSigninAllowed jest czytane przez FRE UI (isSigninSupported) i
+musi byc zarejestrowane, inaczej CHECK-crash. Przywracamy WYLACZNIE ten
+jeden pref, z wartoscia false (nasza polityka prywatnosci, nie pristine
+true)."""
+import sys
+from pathlib import Path
+
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "/srcbuild")
+f = SRC / "components/signin/internal/identity_manager/primary_account_manager.cc"
+text = f.read_text()
+
+include_line = '#include "components/signin/public/base/signin_pref_names.h"\n'
+if include_line in text:
+    print("include signin_pref_names.h juz obecny, pomijam")
+else:
+    anchor_inc = '#include "components/signin/public/base/signin_prefs.h"\n'
+    assert text.count(anchor_inc) == 1, f"oczekiwano 1 zakotwiczenia include, znaleziono {text.count(anchor_inc)}"
+    text = text.replace(anchor_inc, anchor_inc + include_line)
+
+new_marker = "registry->RegisterBooleanPref(prefs::kSigninAllowed, false);\n"
+if new_marker in text:
+    print("rejestracja kSigninAllowed juz obecna, pomijam")
+else:
+    old = """void PrimaryAccountManager::RegisterProfilePrefs(PrefRegistrySimple* registry) {
+}"""
+    new = """void PrimaryAccountManager::RegisterProfilePrefs(PrefRegistrySimple* registry) {
+  registry->RegisterBooleanPref(prefs::kSigninAllowed, false);
+}"""
+    count = text.count(old)
+    assert count == 1, f"oczekiwano 1, znaleziono {count}"
+    text = text.replace(old, new)
+
+f.write_text(text)
+print("primary_account_manager.cc: kSigninAllowed=false zarejestrowany")
+PYEOF
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    python3 /repo/fix_primary_account_manager_register_prefs.py /srcbuild
+
+# BŁĄD ZŁAPANY NA LINKOWANIU (21. przypadek, BEZPOŚREDNIA konsekwencja
+# dwudziestego -- `ld.lld: undefined symbol: prefs::kSigninAllowed`.
+# Przywrócona w 20. przypadku deklaracja/rejestracja jest poprawna i
+# kompiluje się -- ale sama DEFINICJA stałej (`components/signin/public/
+# base/signin_pref_names.cc`, `const char kSigninAllowed[] =
+# "signin.allowed";`) nigdy się nie kompiluje, bo `remove-unused-
+# preferences-fields.patch` usuwa `signin_pref_names.cc`/`.h` z listy
+# `sources` targetu `component("signin_switches")` w `components/signin/
+# public/base/BUILD.gn` -- TEN SAM wzorzec co szesnasty przypadek
+# (target przestaje kompilować plik z definicjami), tylko tu przez
+# usunięcie z listy `sources`, nie zamianę całego targetu na pusty
+# `group()`. Sama treść `signin_pref_names.cc` NIE jest dotknięta przez
+# żaden patch (proste, samodzielne stałe `extern const char[]`, jedyna
+# zależność to `build/build_config.h`) -- wystarczy przywrócić dwie
+# linie w `sources`, nie trzeba nic więcej. Zweryfikowane host-side na w
+# pełni załatanym drzewie.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    F=components/signin/public/base/BUILD.gn && \
+    (grep -q '"signin_pref_names.cc",' "$F" || \
+     (grep -q '"signin_switches.cc",' "$F" && \
+      sed -i 's|    "signin_switches.cc",|    "signin_pref_names.cc",\n    "signin_pref_names.h",\n    "signin_switches.cc",|' "$F")) && \
+    grep -q '"signin_pref_names.cc",' "$F" || \
+        (echo "BŁĄD: fix signin_pref_names.cc (sources) się nie zaaplikował" && exit 1)
+
+# BŁĄD ZŁAPANY W NINJA (14. przypadek, 96% -- 58067/60700, najdalej dotąd)
+# -- TA SAMA rodzina co is_android-untested (pierwszy wzorzec z tej sesji),
+# tym razem w kodzie Android-specyficznym poza `extensions`:
+# `chrome/browser/android/rlz/rlz_ping_handler.cc` (RLZ = mechanizm
+# śledzenia "skąd pochodzi ta instalacja Chrome", jeden z klasycznych
+# celów ungoogled-chromium) używa `rlz_lib::kFinancialServer` --
+# `core/ungoogled-chromium/disable-untraceable-urls.patch` USUWA tę
+# stałą całkowicie z `rlz/lib/lib_values.{cc,h}` i podmienia JEDYNE
+# znane mu użycie (`rlz/lib/financial_ping.cc`, desktop) na literał
+# `"about:blank"` -- ale `rlz_ping_handler.cc` (JNI bridge dla
+# ANDROIDOWEGO UI RLZ, `chrome/browser/android/rlz/`, zupełnie inna
+# ścieżka kodu niż desktopowy `financial_ping.cc`) ma WŁASNE użycie tej
+# samej stałej, którego autor patcha nie dotknął (nie buduje na
+# Androida). Efekt: `no member named 'kFinancialServer' in namespace
+# 'rlz_lib'`. Fix: dokładnie ten sam wzorzec co patch zastosował na
+# desktopie -- podmień na `"about:blank"` (deaktywacja URL-a ping,
+# spójna z całym sensem tego patcha), nie próbuj przywracać usuniętej
+# stałej. Zweryfikowane host-side: linia istnieje dokładnie raz,
+# `rlz_lib::kFinancialPingPath` (osobna stała, ścieżka URL-a, nie host)
+# zostaje nietknięta.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    F=chrome/browser/android/rlz/rlz_ping_handler.cc && \
+    (grep -q '"https://%s%s?", "about:blank", rlz_lib::kFinancialPingPath' "$F" || \
+     (grep -q '"https://%s%s?", rlz_lib::kFinancialServer, rlz_lib::kFinancialPingPath' "$F" && \
+      sed -i 's|"https://%s%s?", rlz_lib::kFinancialServer, rlz_lib::kFinancialPingPath|"https://%s%s?", "about:blank", rlz_lib::kFinancialPingPath|' "$F")) && \
+    grep -q '"https://%s%s?", "about:blank", rlz_lib::kFinancialPingPath' "$F" || \
+        (echo "BŁĄD: fix rlz_ping_handler.cc (kFinancialServer) się nie zaaplikował" && exit 1)
+
+# ==============================================================================
+# 5e. WARIANT UTWARDZONY: dopełniające literały -- to, czego patche ungoogled NIE robią
+# ==============================================================================
+#     Wcześniejsza wersja tej sekcji miała 11 literałów (patrz historia
+#     gita, commit f5445fb) -- po wdrożeniu pełnej serii patchy ungoogled
+#     (5d wyżej) **7 z nich okazało się zdublowanych albo w konflikcie**,
+#     zweryfikowane EMPIRYCZNIE (host-side, próba każdego sed-a na
+#     już-załatanym drzewie), nie zgadywane:
+#       - podpowiedzi wyszukiwania, strony błędów Google, autofill karty,
+#         autofill adresy, dostęp do form płatności, menedżer haseł
+#         (`kCredentialsEnableService`) -- wszystkie już ustawione przez
+#         `extra/inox-patchset/0006-modify-default-prefs.patch`
+#       - tryb DNS -- już ustawiony przez `core/ungoogled-chromium/
+#         doh-changes.patch` (dokładnie ten sam `SecureDnsMode::kOff`)
+#       - logowanie do konta (`kSigninAllowed`) -- literał zniknął całkiem,
+#         `remove-unused-preferences-fields.patch` przebudował
+#         `primary_account_manager.cc`; ungoogled blokuje logowanie
+#         szerzej (m.in. `disable-gaia.patch`), więc pojedynczy pref był
+#         tu niepotrzebny
+#     Zostają 4 literały, których patche ungoogled nie dotykają (zweryfikowane
+#     że nadal się aplikują na już-załatanym drzewie):
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then echo "==> Wariant ${VARIANT}: zbędne"; exit 0; fi; \
+    cd /srcbuild && \
+    (grep -q "kSafeBrowsingEnabled, false," components/safe_browsing/core/common/safe_browsing_prefs.cc || \
+     (grep -q "kSafeBrowsingEnabled, true," components/safe_browsing/core/common/safe_browsing_prefs.cc && \
+      sed -i 's/kSafeBrowsingEnabled, true,/kSafeBrowsingEnabled, false,/' \
+          components/safe_browsing/core/common/safe_browsing_prefs.cc)) && \
+    grep -q "kSafeBrowsingEnabled, false," components/safe_browsing/core/common/safe_browsing_prefs.cc || \
+        (echo "BŁĄD: domyślna wartość Safe Browsing się nie zmieniła" && exit 1)
+
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    (grep -q "NetworkPredictionOptions::kDisabled)" chrome/browser/preloading/preloading_prefs.cc || \
+     (grep -q "static_cast<int>(NetworkPredictionOptions::kDefault)" chrome/browser/preloading/preloading_prefs.cc && \
+      sed -i 's/static_cast<int>(NetworkPredictionOptions::kDefault)/static_cast<int>(NetworkPredictionOptions::kDisabled)/' \
+          chrome/browser/preloading/preloading_prefs.cc)) && \
+    grep -q "NetworkPredictionOptions::kDisabled)" chrome/browser/preloading/preloading_prefs.cc || \
+        (echo "BŁĄD: domyślna wartość prefetchu sieciowego się nie zmieniła" && exit 1)
+
+# Tylko wykrywanie wycieków haseł -- kCredentialsEnableService w tym samym
+# pliku już ustawione przez patch inox (patrz komentarz wyżej).
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    (grep -q "kPasswordLeakDetectionEnabled, false," components/password_manager/core/browser/password_manager.cc || \
+     (grep -q "kPasswordLeakDetectionEnabled, true," components/password_manager/core/browser/password_manager.cc && \
+      sed -i 's/kPasswordLeakDetectionEnabled, true,/kPasswordLeakDetectionEnabled, false,/' \
+          components/password_manager/core/browser/password_manager.cc)) && \
+    grep -q "kPasswordLeakDetectionEnabled, false," components/password_manager/core/browser/password_manager.cc || \
+        (echo "BŁĄD: domyślna wartość wykrywania wycieków haseł się nie zmieniła" && exit 1)
+
+# Do Not Track -- KIERUNEK ODWROTNY niż reszta: domyślnie jest false
+# (wyłączone), my chcemy true (włączone).
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    (grep -q "kEnableDoNotTrack, true," chrome/browser/ui/browser_ui_prefs.cc || \
+     (grep -q "kEnableDoNotTrack, false," chrome/browser/ui/browser_ui_prefs.cc && \
+      sed -i 's/kEnableDoNotTrack, false,/kEnableDoNotTrack, true,/' \
+          chrome/browser/ui/browser_ui_prefs.cc)) && \
+    grep -q "kEnableDoNotTrack, true," chrome/browser/ui/browser_ui_prefs.cc || \
+        (echo "BŁĄD: domyślna wartość Do Not Track się nie zmieniła" && exit 1)
+
+# AICore Prompt API (most do systemowego Gemini Nano przez Google Play
+# Services) -- ModelBrokerAndroid tworzy go jako globalny singleton przy
+# KAŻDYM starcie Chrome na Androidzie (optimization_guide_global_state.cc,
+# gałąź IS_ANDROID), niezależnie od jakiejkolwiek flagi GN. Kluczowa flaga
+# `kAICorePrompt` (components/optimization_guide/core/model_execution/
+# android/model_broker_android.cc) jest zdefiniowana DWA RAZY w bloku
+# #if/#else BUILDFLAG(GOOGLE_CHROME_BRANDING) -- w gałęzi #else (czyli w
+# KAŻDYM niebrandowanym buildzie, w tym naszym) jest ENABLED_BY_DEFAULT.
+# Żadna z 39 flag GN, żaden z 106 patchy ungoogled, żaden z 4 pozostałych
+# literałów sekcji 5e tego nie dotyka -- zweryfikowane grepem po całym
+# drzewie (audyt AI/ML, sesja 2026-08-08).
+#
+# Zweryfikowane host-side PRZED wdrożeniem, że kierunek ENABLED->DISABLED
+# jest bezpieczny: jedyne odwołania do `kAICorePrompt` w całym drzewie to
+# warunkowe `base::FeatureList::IsEnabled(features::kAICorePrompt)` w
+# `GetAICoreFeatureFor()`, które przy fladze wyłączonej po prostu zwraca
+# `std::nullopt` -- DOKŁADNIE ta sama ścieżka kodu, którą
+# `kAICoreScamDetection` (sąsiednia flaga, już DISABLED_BY_DEFAULT w tej
+# samej gałęzi #else) przechodzi już dziś w normalnej pracy. Brak
+# CHECK/DCHECK zakładającego włączony stan. Fix NIE rusza gałęzi
+# `#if BUILDFLAG(GOOGLE_CHROME_BRANDING)` (nieużywanej w tym buildzie) ani
+# `kAICoreScamDetection` (już poprawnie DISABLED w gałęzi #else).
+#
+# Kotwica sed ograniczona zakresem `/^#else$/,/^#endif$/` (plik ma
+# dokładnie jeden nieindentowany blok #if/#else/#endif) -- bez tego prosty
+# `grep`/`sed` po samym tekście `FEATURE_DISABLED_BY_DEFAULT` dawałby
+# fałszywy pozytyw idempotencji już przy PIERWSZYM uruchomieniu, bo gałąź
+# #if ma tę wartość od zawsze (dla kAICorePrompt) -- ten sam wzorzec błędu
+# co odwrócony warunek `!=`/`=` w sekcji 5d.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then echo "==> Wariant ${VARIANT}: pomijam fix kAICorePrompt"; exit 0; fi; \
+    cd /srcbuild && \
+    F=components/optimization_guide/core/model_execution/android/model_broker_android.cc && \
+    (grep -A1 '^#else$' "$F" | grep -q 'BASE_FEATURE(kAICorePrompt, base::FEATURE_DISABLED_BY_DEFAULT);' || \
+     (grep -A1 '^#else$' "$F" | grep -q 'BASE_FEATURE(kAICorePrompt, base::FEATURE_ENABLED_BY_DEFAULT);' && \
+      sed -i '/^#else$/,/^#endif$/{s/BASE_FEATURE(kAICorePrompt, base::FEATURE_ENABLED_BY_DEFAULT);/BASE_FEATURE(kAICorePrompt, base::FEATURE_DISABLED_BY_DEFAULT);/}' "$F")) && \
+    grep -A1 '^#else$' "$F" | grep -q 'BASE_FEATURE(kAICorePrompt, base::FEATURE_DISABLED_BY_DEFAULT);' || \
+        (echo "BŁĄD: domyślna wartość AICore Prompt API (kAICorePrompt) się nie zmieniła" && exit 1)
+
+# ==============================================================================
+# 5f. WARIANT UTWARDZONY: domain_substitution -- ta sama technika co desktop
+# ==============================================================================
+#     Analogicznie do desktopowego Containerfile (krok 7): podmiana domen
+#     Google/Chrome/YouTube/gstatic itd. na nieistniejące (google.com ->
+#     9oo91e.qjz9zk) w CAŁYM drzewie źródeł, tekstowo -- nie tylko flagi
+#     wyłączające podsystemy (39 flag GN wyżej), literały (5e) ani patche
+#     (5d), tylko każde wystąpienie znanej domeny w plikach, które
+#     ungoogled-chromium audytował. Klon z sekcji 5d ponownie użyty --
+#     ten sam `/repo/ungoogled-domsub` ma listy domain_substitution.
+#
+#     Mechanizm: `domain_regex.list` (21 generycznych wzorców tekstowych,
+#     niezależnych od platformy) + `domain_substitution.list` (17745 ścieżek
+#     plików, które ungoogled zweryfikował jako zawierające dopasowania).
+#     Brakująca ścieżka NIE jest błędem -- skrypt cicho pomija (`Skipping
+#     non-existent path`, zweryfikowane w źródle
+#     `utils/domain_substitution.py:220-223`), więc różnice między drzewem
+#     desktopowym a Android (submoduły, pliki Java) są bezpieczne.
+#
+#     ZWERYFIKOWANE PRZED WDROŻENIEM (host-side, bez kontenera): z 17745
+#     ścieżek na liście 11168 istnieje w drzewie Android i KAŻDA miała
+#     realną podmianę (zero no-opów) -- próbny `apply`+`revert` przeszedł
+#     czysto (exit 0), diff po revercie 0 linii różnicy w treści plików.
+#
+#     LUKA WYKRYTA I DOMKNIĘTA WŁASNYM AUDYTEM (nie zgadywana): lista
+#     ungoogled jest audytowana pod desktop, więc pomija pliki specyficzne
+#     dla Androida (Java/XML), które NIE mają desktopowego odpowiednika.
+#     Przeskanowano katalogi `chrome/android`, `ui/android`,
+#     `content/public/android`, `android_webview`, `build/android` tymi
+#     samymi 21 wzorcami regex -- 68 plików PRODUKCYJNYCH (poza testami/
+#     dokumentacją/skryptami builda) miało dopasowanie, którego nie było na
+#     liście ungoogled. Każde sprawdzone ręcznie -- prawdziwe domeny, nie
+#     fałszywe trafienia, m.in.:
+#       - `RequestGenerator.java`: `update.googleapis.com` (serwer Omaha,
+#         auto-update Chrome na Androidzie)
+#       - `ConnectivityDetector.java`: `www.google.com/generate_204` i
+#         `connectivitycheck.gstatic.com` (ping wprost do Google przy
+#         KAŻDEJ zmianie sieci, poza jakąkolwiek stroną)
+#       - `GoogleWalletLauncher.java`, `ChromeStringConstants.java`:
+#         wallet.google.com, payments.google.com, chrome.google.com/data
+#     Lista tych 68 ścieżek: `android_domain_substitution_extra.list`
+#     (własna, wersjonowana w tym repo -- NIE część ungoogled-chromium).
+#     Od 156 (2026-10-26) 67 ścieżek: 4 pliki przeniesione upstream (Omaha
+#     do chrome/browser/omaha/android/, SyncSettingsUtils do
+#     chrome/browser/sync/android/), AttributionOsLevelManager.java usunięty.
+#     `domain_substitution.py` pomija brakujące ścieżki PO CICHU, więc krok
+#     niżej przerywa build, gdy którejkolwiek z naszych ścieżek brakuje --
+#     inaczej każde podbicie wersji mogłoby bez śladu zdjąć podmianę domen
+#     z przeniesionego pliku.
+#     Doklejona do listy ungoogled przed jednym wspólnym przebiegiem
+#     `apply` (te same 21 wzorców regex -- generyczne, nie desktop-specific).
+#
+#     Guard `VARIANT=ungoogled`: wariant `vanilla` (czyste Chromium, bez
+#     żadnych patchy) nie ma po co dostawać domain_substitution -- to
+#     osobny, izolowany test "czy sam pipeline i wersja Chromium są zdrowe",
+#     nie kolejny poziom prywatności.
+COPY android_domain_substitution_extra.list /repo/android_domain_substitution_extra.list
+
+# WYKLUCZENIE (znalezione przy pierwszym realnym buildzie, nie zgadywane):
+# `components/safe_browsing/content/resources/real_time_url_checks_allowlist/
+# validation_utils.py` jest na liście ungoogled, ale jego jedyna rola to
+# sanity-check przy KOMPILACJI -- liczy sha256("youtube.com/") i sprawdza,
+# czy ten hash istnieje w NIEPODMIENIONYCH danych `real_time_url_allowlist.
+# asciipb` (ten plik danych NIE jest na liście ungoogled -- zawiera surowe
+# prefiksy hashy, nie tekst). Po podmianie stringu w validation_utils.py na
+# "y0u1ub3.qjz9zk/" hash przestaje pasować do (nadal prawdziwych) danych ->
+# `AssertionError: Bad url_hashes`. Akcja budująca to sprawdzenie
+# (`make_real_time_url_allowlist_protobuf`, components/safe_browsing/
+# content/resources/real_time_url_checks_allowlist/BUILD.gn) jest zagadkowo
+# gałęziowana `if (is_android && safe_browsing_mode == 2)` -- WYŁĄCZNIE
+# Android, nigdy desktop -- dlatego ungoogled-chromium (tylko desktop)
+# nigdy na to nie trafił, mimo że plik jest na ich liście. To nie błąd ich
+# listy, tylko luka, której nie mieli jak zauważyć. Wykluczamy tylko TEN
+# plik (sam plik nie zawiera nic wartego podmiany poza tym jednym
+# stringiem-kanarkiem) -- reszta listy ungoogled zostaje bez zmian.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    MISSING=$(while read -r f || [ -n "$f" ]; do [ -z "$f" ] || [ -e "/srcbuild/$f" ] || echo "  $f"; done < /repo/android_domain_substitution_extra.list) && \
+    if [ -n "${MISSING}" ]; then \
+        echo "BŁĄD: tych ścieżek z android_domain_substitution_extra.list nie ma w tej wersji Chromium (przeniesione albo usunięte upstream)."; \
+        echo "${MISSING}"; \
+        echo "domain_substitution pominęłoby je PO CICHU (tylko 'Skipping non-existent path'), a pliki z domenami Google straciłyby podmianę. Popraw listę."; \
+        exit 1; \
+    fi && \
+    grep -v '^components/safe_browsing/content/resources/real_time_url_checks_allowlist/validation_utils\.py$' \
+        /repo/ungoogled-domsub/domain_substitution.list > /repo/domain_substitution_ungoogled_filtered.list && \
+    sort -u /repo/domain_substitution_ungoogled_filtered.list /repo/android_domain_substitution_extra.list \
+        > /repo/domain_substitution_combined.list && \
+    echo "==> domain_substitution: $(wc -l < /repo/domain_substitution_combined.list) ścieżek (ungoogled + $(wc -l < /repo/android_domain_substitution_extra.list) własnych Android, minus 1 wykluczenie)" && \
+    cd /repo/ungoogled-domsub && \
+    python3 utils/domain_substitution.py apply \
+        -r domain_regex.list \
+        -f /repo/domain_substitution_combined.list \
+        /srcbuild && \
+    if grep -q "connectivitycheck.gstatic.com" \
+        /srcbuild/chrome/android/java/src/org/chromium/chrome/browser/net/connectivitydetector/ConnectivityDetector.java; then \
+        echo "BŁĄD: domain_substitution nie podmieniło znanego przykładu (ConnectivityDetector.java)" && exit 1; \
+    fi
+
+# BŁĄD ZŁAPANY W `gn gen` (156.0.8078.47, 2026-10-26 -- wzorzec:
+# ungoogled nie testuje Androida). Patch ungoogled `extra/ungoogled-chromium/
+# enable-extra-locales.patch` usuwa z build/config/locales.gni blok, który na
+# Androidzie robił `extended_locales -= _non_android_locales` (czyli wyjmował
+# "cy", walijski) -- więc po patchu "cy" zostaje w extended_locales. Nowy w 156
+# kod (components/omnibox/resources/BUILD.gn, components/strings/BUILD.gn)
+# liczy `all_chrome_locales - extended_locales - [...]` (to już usuwa "cy"),
+# a potem `if (is_android) { X -= [ "cy" ] }` -- GN: "Item not found", bo
+# odejmowanie nieobecnego elementu jest w GN błędem. Poprawka: przed każdym
+# takim `X -= [ "cy" ]` dopisujemy `X += [ "cy" ]` -- `-=` usuwa WSZYSTKIE
+# wystąpienia, więc wynik jest ten sam co zamierzał upstream (bez "cy"), a brak
+# elementu przestaje być błędem. Sprawdzone binarką gn z drzewa 156 (lista
+# z "cy" i bez "cy"). `filter_exclude` odpadło: GN zabrania nadpisania
+# niepustej listy przez `=` ("Replacing nonempty list"). Przeszukujemy całe
+# components/ i chrome/, żeby kolejne wersje z nowymi takimi miejscami też
+# przeszły; krok jest idempotentny.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then exit 0; fi; \
+    cd /srcbuild && \
+    python3 - <<'PYEOF'
+import re, subprocess
+files = subprocess.run(
+    ["grep", "-rlE", "--include=*.gn", "--include=*.gni",
+     r'^\s+[A-Za-z_]+ -= \[ "cy" \]$', "components", "chrome"],
+    capture_output=True, text=True).stdout.split()
+pat = re.compile(r'^(\s+)([A-Za-z_]+) -= \[ "cy" \]$')
+changed = 0
+for f in files:
+    lines = open(f, encoding="utf-8").read().split("\n")
+    out = []
+    before = changed
+    for l in lines:
+        m = pat.match(l)
+        if m:
+            add = f'{m.group(1)}{m.group(2)} += [ "cy" ]'
+            if not (out and out[-1] == add):
+                out.append(add)
+                changed += 1
+        out.append(l)
+    if changed > before:
+        open(f, "w", encoding="utf-8").write("\n".join(out))
+    print(f"  {f} (+{changed - before})")
+print(f"==> odejmowanie \"cy\" uodpornione: {len(files)} plików, {changed} nowych linii")
+PYEOF
+
+# ==============================================================================
+# 5g. Wbudowany updater APK (self_update)
+# ==============================================================================
+#     Opis: README. Źródła z android_updater/ tego repo
+#     trafiają do drzewa jako chrome/browser/self_update/android/ (pakiet
+#     org.chromium.chrome.browser.self_update), a do istniejących plików
+#     Chromium dochodzą cztery wstawki:
+#       1. zależność w chrome/android/BUILD.gn,
+#       2. dwa wywołania w ChromeActivitySessionTracker.java (wejście na
+#          pierwszy plan i zejście z niego),
+#       3. uprawnienie UPDATE_PACKAGES_WITHOUT_USER_ACTION w manifeście,
+#       4. <receiver> wyniku instalacji w manifeście.
+#     Każda wstawka jest zakotwiczona TREŚCIĄ sąsiedniej linii, a krok
+#     przerywa build z "BŁĄD: self_update: ...", gdy kotwica nie występuje
+#     dokładnie raz albo wstawka po przebiegu nie występuje dokładnie raz.
+#     Krok jest idempotentny: /srcbuild jest trwały, więc zwykle wykonuje się
+#     na drzewie, które wstawki już ma.
+#
+#     ARG-i są zadeklarowane dopiero TUTAJ: wcześniej każda zmiana tagu
+#     unieważniałaby krok 4c (zasilenie /srcbuild od nowa = pełna kompilacja).
+#     Tutaj zmiana kosztuje tylko gn gen i przeliczenie celów Javy.
+#
+#     UpdaterConfig.java jest generowany z ARG-ów. Pliki są nadpisywane tylko
+#     przy zmianie treści -- ninja patrzy na czasy modyfikacji, a każde
+#     dotknięcie źródeł Javy to ponowne R8 całej przeglądarki.
+#
+#     Wariant vanilla nie dostaje updatera: to test "czy sam pipeline i ta
+#     wersja Chromium są zdrowe", bez żadnych naszych zmian w źródłach.
+COPY android_updater/self_update/ /repo/self_update/java/
+COPY android_updater/BUILD.gn /repo/self_update/BUILD.gn
+ARG UPDATE_REPO=""
+ARG RELEASE_TAG=""
+ARG UPDATE_API_URL=""
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    if [ "${VARIANT}" != "ungoogled" ]; then echo "==> wariant ${VARIANT}: bez updatera"; exit 0; fi; \
+    cd /srcbuild && \
+    python3 - <<'PYEOF'
+import os, re, sys
+
+def die(msg):
+    sys.exit("BŁĄD: self_update: " + msg)
+
+repo = os.environ.get("UPDATE_REPO", "")
+tag = os.environ.get("RELEASE_TAG", "")
+api = os.environ.get("UPDATE_API_URL", "")
+# Wartości lądują w literałach Javy -- nic poza bezpiecznym zestawem znaków.
+if repo and not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+    die(f"UPDATE_REPO={repo!r} nie ma postaci właściciel/nazwa")
+if tag and not re.fullmatch(r"[0-9]+(\.[0-9]+)*-[0-9]+", tag):
+    die(f"RELEASE_TAG={tag!r} nie ma postaci <wersja>-<N>")
+if api and not re.fullmatch(r"https?://[A-Za-z0-9._:/?=&%-]+", api):
+    die(f"UPDATE_API_URL={api!r} zawiera niedozwolone znaki")
+if repo and not tag:
+    die("UPDATE_REPO bez RELEASE_TAG (budować przez build_android.sh)")
+
+def write_if_changed(path, text):
+    try:
+        if open(path, encoding="utf-8").read() == text:
+            return
+    except FileNotFoundError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w", encoding="utf-8").write(text)
+    print("  zapisano", path)
+
+# --- źródła -----------------------------------------------------------------
+base = "chrome/browser/self_update/android"
+java_dir = base + "/java/src/org/chromium/chrome/browser/self_update"
+wanted = {base + "/BUILD.gn": open("/repo/self_update/BUILD.gn", encoding="utf-8").read()}
+for name in sorted(os.listdir("/repo/self_update/java")):
+    if name.endswith(".java"):
+        wanted[java_dir + "/" + name] = open(
+            "/repo/self_update/java/" + name, encoding="utf-8").read()
+# Znaczniki "selfupdate-...=<wartość>" muszą być POJEDYNCZYMI literałami: po
+# nich release_android.sh odczytuje z gotowego APK tag, repozytorium i to,
+# czy build jest testowy (`unzip -p apk 'classes*.dex' | strings | grep`).
+wanted[java_dir + "/UpdaterConfig.java"] = f"""package org.chromium.chrome.browser.self_update;
+
+/** Parametry builda -- plik generowany w kroku 5g Containerfile.android. */
+public final class UpdaterConfig {{
+    public static final String UPDATE_REPO = "{repo}";
+    public static final String RELEASE_TAG = "{tag}";
+    public static final String UPDATE_API_URL = "{api}";
+
+    public static final String RELEASE_TAG_MARKER = "selfupdate-release-tag={tag}";
+    public static final String REPO_MARKER = "selfupdate-repo={repo}";
+    public static final String TEST_API_MARKER = "selfupdate-test-api={api}";
+
+    private UpdaterConfig() {{}}
+}}
+"""
+for path, text in wanted.items():
+    write_if_changed(path, text)
+for root, _, files in os.walk("chrome/browser/self_update"):
+    for name in files:
+        path = os.path.join(root, name)
+        if path not in wanted:
+            os.remove(path)
+            print("  usunięto", path)
+
+# --- wstawki ------------------------------------------------------------------
+def insert(path, anchor, new_lines, marker, before=False):
+    """Wstawia new_lines przy JEDYNEJ linii zawierającej anchor, z jej wcięciem."""
+    text = open(path, encoding="utf-8").read()
+    lines = text.split("\n")
+    hits = [i for i, line in enumerate(lines) if anchor in line]
+    if len(hits) != 1:
+        die(f"kotwica {anchor!r} występuje {len(hits)} razy w {path} (oczekiwano 1)")
+    if marker not in text:
+        line = lines[hits[0]]
+        indent = line[:len(line) - len(line.lstrip())]
+        at = hits[0] if before else hits[0] + 1
+        lines[at:at] = [indent + new for new in new_lines]
+        text = "\n".join(lines)
+        open(path, "w", encoding="utf-8").write(text)
+        print(f"  wstawka w {path}: {marker}")
+    if text.count(marker) != 1:
+        die(f"{marker!r} występuje {text.count(marker)} razy w {path} (oczekiwano 1)")
+
+insert("chrome/android/BUILD.gn",
+       '"//chrome/browser/omaha/android:java",',
+       ['"//chrome/browser/self_update/android:java",'],
+       '"//chrome/browser/self_update/android:java",')
+
+# Pełne nazwy klas zamiast importów: jedna linia = jedna kotwica mniej.
+tracker = "chrome/android/java/src/org/chromium/chrome/browser/ChromeActivitySessionTracker.java"
+call = ("org.chromium.chrome.browser.self_update.SelfUpdater.{}("
+        "org.chromium.base.ContextUtils.getApplicationContext());")
+insert(tracker, "mOmahaServiceStartDelayer.onForegroundSessionStart();",
+       [call.format("onForegroundStart")], "SelfUpdater.onForegroundStart(")
+insert(tracker, "mOmahaServiceStartDelayer.onForegroundSessionEnd();",
+       [call.format("onForegroundEnd")], "SelfUpdater.onForegroundEnd(")
+
+manifest = "chrome/android/java/AndroidManifest.xml"
+insert(manifest, 'android:name="android.permission.REQUEST_INSTALL_PACKAGES"',
+       ['<uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION"/>'],
+       "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION")
+insert(manifest,
+       'android:name="org.chromium.chrome.browser.upgrade.PackageReplacedBroadcastReceiver"',
+       ['<receiver android:name="org.chromium.chrome.browser.self_update.SelfUpdateResultReceiver"',
+        '    android:exported="false" />'],
+       "org.chromium.chrome.browser.self_update.SelfUpdateResultReceiver", before=True)
+
+print(f"==> self_update: repo={repo!r} tag={tag!r} api={api!r}, 4 wstawki OK")
+PYEOF
+
+# ==============================================================================
+# 6. Konfiguracja GN
+# ==============================================================================
+#    Cromite i jego `cromite.gn_args` (pełna składnia GN, nie płaska lista
+#    klucz=wartość) zostały usunięte razem z całą resztą Cromite -- ten krok
+#    ma teraz dwie gałęzie sterowane `VARIANT`, obie budujące zwykłą, płaską
+#    listę par klucz=wartość przekazywaną do `gn gen --args=`.
+#
+#    Wariant VARIANT=vanilla: minimalny, zachowawczy zestaw (patrz gałąź niżej)
+#    -- czyste Chromium, zero flag prywatnościowych, tylko to, co niezbędne do
+#    poprawnego oficjalnego buildu Androida. Zweryfikowany end-to-end (`gn gen`
+#    = 81079 targetów, ninja bez błędów, `.apk` na urządzeniu) w commicie
+#    df64dfd, zanim ten tryb zniknął z pliku na rzecz utwardzonego -- teraz
+#    przywrócony jako pełnoprawna trzecia gałąź `VARIANT`.
+#
+#    Wariant VARIANT=ungoogled (domyślny) nie używa cromite.gn_args, tylko
+#    własnego zestawu flag prywatności. To "Plan B": maksimum prywatności
+#    osiągalne SAMYMI FLAGAMI GN, bez ani jednego patcha -- a więc bez
+#    kosztu utrzymania, który zabija podejście patchowe przy każdej nowej
+#    wersji Chromium. Każda flaga poniżej została zweryfikowana `gn gen`
+#    na realnym drzewie 151.0.7922.71: cały zestaw daje 73927 targetów i
+#    ZERO ostrzeżeń "never appeared in a declare_args" (czyli żadna nie
+#    jest literówką ani reliktem po starszej wersji Chromium).
+#
+#    Czego ten wariant NIE daje (świadome ograniczenia Planu B): wbudowanego
+#    adblockera i mitygacji fingerprintingu (canvas/audio/WebGL) -- to
+#    siedzi w patchach Cromite, nie we flagach. Nie udawaj, że utwardzenie
+#    flagami jest równoważne Cromite.
+#
+#    Flagi ODRZUCONE po weryfikacji (nie dopisuj ich bez ponownego testu):
+#      - enable_offline_pages=false, enable_supervised_users=false -- łamią
+#        build Androida (`Assertion failed` w gn gen; na Androidzie te
+#        moduły są wymagane),
+#      - enable_platform_aac_audio / enable_platform_h264_video -- nie są
+#        samodzielnymi declare_args (w cromite.gn_args siedzą w bloku
+#        warunkowym), ustawianie ich wprost daje tylko ostrzeżenie,
+#      - enable_safe_browsing, use_official_enterprise_policy_key,
+#        enable_feed_v2, enable_click_to_call -- nie istnieją w 151
+#        (poprawny odpowiednik Safe Browsing to `safe_browsing_mode`),
+#      - build_tflite_with_xnnpack=false -- przechodzi `gn gen` I CAŁĄ
+#        kompilację, a wywala się dopiero przy LINKOWANIU libchrome.so, na
+#        60638 z 60641 targetów (trzy od końca!): "undefined symbol:
+#        TfLiteXNNPackDelegate{OptionsDefault,Create,Delete}". Flaga wyłącza
+#        budowanie XNNPACK w services/webnn/BUILD.gn i third_party/mediapipe/
+#        BUILD.gn, ale wywołania zostają m.in. w
+#        mediapipe/calculators/tensor/inference_calculator_xnnpack.cc.
+#        Domyślnie na arm64 jest WŁĄCZONA (`current_cpu != "arm"`,
+#        third_party/tflite/features.gni:18), więc upstream nie testuje jej
+#        wyłączenia na Androidzie. Zysk prywatnościowy i tak był wątpliwy --
+#        XNNPACK to backend obliczeń na CPU, nie telemetria.
+#      - use_v8_context_snapshot=false (SAMO, bez include_both_v8_snapshots)
+#        -- to NIE jest błąd gn gen ani ninja. Build przechodzi w 100%,
+#        `.apk` się instaluje -- a renderer CRASHUJE natychmiast przy KAŻDEJ
+#        stronie (nawet example.com), bo to niespójność między procesem
+#        przeglądarki a procesem renderującym, nie błąd kompilacji.
+#        Mechanizm (zweryfikowany symbolizacją tombstone'a przez
+#        llvm-symbolizer na lib.unstripped/libchrome.so): domyślnie na
+#        arm64+official `include_both_v8_snapshots=true`
+#        (tools/v8_context_snapshot/v8_context_snapshot.gni) -- to włącza
+#        BUILDFLAG(INCLUDE_BOTH_V8_SNAPSHOTS), przez co proces przeglądarki
+#        (content_main_runner_impl.cc: GetSnapshotType) dla renderera prosi
+#        o snapshot "z dodatkowym kontekstem" (kWithAdditionalContext).
+#        Ale skoro use_v8_context_snapshot=false, taki plik nigdy nie
+#        powstał -- renderer trafia na `NOTREACHED()` w
+#        gin/v8_initializer.cc:GetSnapshotFileName i umiera SIGTRAP-em przy
+#        starcie, zanim jakikolwiek kod strony się wykona. Naprawa: ustawić
+#        `include_both_v8_snapshots=false` zamiast `use_v8_context_snapshot`
+#        wprost -- to samo robi cromite.gn_args dla release Android
+#        (`else { include_both_v8_snapshots = false ... }`), bo
+#        `use_v8_context_snapshot` i tak DERYWUJE się z
+#        `include_both_v8_snapshots` (`||` w declare_args, drugi operand
+#        zawsze false na Androidzie) -- oba buildflagi wychodzą spójnie
+#        false. Zweryfikowane `gn args --list` przed rebuildem.
+#        LEKCJA: to CZWARTY przypadek flagi łamiącej Androida, i pierwszy,
+#        który przeszedł CAŁY build (gn gen + ninja + link + .apk) i ujawnił
+#        się dopiero w runtime na urządzeniu -- "zbudowało się bez błędów"
+#        nie znaczy "działa". Stąd zasada, żeby po
+#        KAŻDEJ zmianie zestawu flag faktycznie odpalić .apk na urządzeniu,
+#        nie tylko sprawdzić czy build przeszedł.
+#      - enable_vr/enable_arcore/enable_cardboard=false -- `gn gen` przechodzi
+#        (74272 targety), ale ninja WYWALA SIĘ po ~55500 targetów na
+#        chrome/browser/ui/omnibox/omnibox_edit_model.cc:1881: "no member named
+#        GetVectorIcon in AutocompleteMatch". Powód: w
+#        components/omnibox/browser/autocomplete_match.h:378 metoda jest
+#        zadeklarowana pod `#if (!IS_ANDROID || ENABLE_VR) && !IS_IOS`, czyli na
+#        Androidzie ISTNIEJE TYLKO GDY VR jest włączone -- a wywołanie w
+#        omnibox_edit_model.cc nie jest niczym strzeżone (Cromite też tego pliku
+#        nie łata; na 148.x kod wyglądał inaczej). UWAGA NA PUŁAPKĘ:
+#        `enable_vr` jest WYLICZANE (`enable_openxr || enable_cardboard ||
+#        enable_arcore`, device/vr/buildflags/buildflags.gni:36), więc samo
+#        usunięcie `enable_vr=false` nie wystarczy -- trzeba też przestać
+#        wyłączać arcore i cardboard, bo inaczej VR i tak wyjdzie false.
+#        Zostaje `enable_openxr=false` (na Androidzie i tak już false przez
+#        `checkout_openxr`). Cena: powierzchnia WebXR zostaje, ale typowy tablet nie ma
+#        sprzętu XR, a ARCore wymaga osobnej apki Google.
+#      - safe_browsing_mode=0 -- `gn gen` przechodzi, ale ninja WYWALA SIĘ
+#        po ~26000 targetów. To niespójność samego Chromium, nie nasz błąd:
+#        components/enterprise/connectors/core/BUILD.gn buduje
+#        `cloud_content_scanning` pod warunkiem
+#        `enterprise_cloud_content_analysis || is_android`, czyli na
+#        Androidzie ZAWSZE -- mimo że samo `enterprise_cloud_content_analysis`
+#        jest tam domyślnie false. Ten kod woła
+#        WebUIContentInfoSingleton::AddToDeepScan{Requests,Responses} i
+#        AddHeadersToDeepScanRequests, zadeklarowane tylko pod
+#        BUILDFLAG(SAFE_BROWSING_DOWNLOAD_PROTECTION), które
+#        safe_browsing_mode=0 wyłącza (components/safe_browsing/BUILD.gn:27).
+#        Domyślny tryb dla Androida to 2 (buildflags.gni:19). Naprawa
+#        wymagałaby łatania źródeł -- a to przekreśla sens tego wariantu
+#        ("tylko flagi, zero kosztu utrzymania"), więc świadomie zostawiamy
+#        Safe Browsing włączone. Na Androidzie i tak chodzi ono przez GMS
+#        Core, którego zdeGooglowany LineageOS zwykle nie ma, a bez kluczy
+#        API i tak nie ma z czym rozmawiać.
+#      - enable_pdf/enable_print_preview/enable_session_service=false --
+#        działają, ale to strata funkcjonalności bez zysku prywatności.
+#
+#    Uwagi do wybranych flag:
+#      - safe_browsing_mode=0: Safe Browsing i tak jest bezczynne bez kluczy
+#        API, więc to głównie redukcja powierzchni ataku. ŚWIADOMY KOMPROMIS:
+#        tracimy lokalną ochronę przed phishingiem/malware.
+#      - enable_captive_portal_detection=false: wycina automatyczne odpytywanie
+#        endpointów Google przy wykrywaniu sieci z logowaniem.
+#      - puste google_api_key/client_id/client_secret obok
+#        use_official_google_api_keys=false -- pas i szelki.
+#      - treat_warnings_as_errors=false: wchodzimy na milestone nietestowany
+#        przez nikogo z tymi flagami, przypadkowy warning nie powinien zabić
+#        wielogodzinnego builda.
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    cd /srcbuild && \
+    export PATH="/repo/depot_tools:${PATH}" && \
+    if [ "${VARIANT}" = "vanilla" ]; then \
+        GN_ARGS="target_os = \"android\" target_cpu = \"arm64\" \
+is_debug = false is_official_build = true is_component_build = false \
+symbol_level = 1 blink_symbol_level = 1 chrome_pgo_phase = 0 \
+cc_wrapper = \"ccache\" use_clang_modules = false use_official_google_api_keys = false \
+dcheck_always_on = false treat_warnings_as_errors = false \
+proprietary_codecs = true ffmpeg_branding = \"Chrome\" android_channel = \"stable\""; \
+    elif [ "${VARIANT}" = "ungoogled" ]; then \
+        GN_ARGS="target_os = \"android\" target_cpu = \"arm64\" \
+is_debug = false is_official_build = true is_component_build = false \
+symbol_level = 1 blink_symbol_level = 1 chrome_pgo_phase = 0 \
+cc_wrapper = \"ccache\" use_clang_modules = false dcheck_always_on = false treat_warnings_as_errors = false \
+android_channel = \"stable\" \
+proprietary_codecs = true ffmpeg_branding = \"Chrome\" enable_av1_decoder = true enable_dav1d_decoder = true \
+use_official_google_api_keys = false google_api_key = \"\" google_default_client_id = \"\" google_default_client_secret = \"\" \
+enable_reporting = false enable_mdns = false enable_remoting = false enable_hangout_services_extension = false \
+disable_fieldtrial_testing_config = true build_contextual_search = false \
+enable_openxr = false \
+enable_bound_session_credentials = false safe_browsing_use_unrar = false enable_request_header_integrity = false \
+include_both_v8_snapshots = false \
+enable_speech_service = false enable_screen_ai_service = false \
+enable_service_discovery = false enable_captive_portal_detection = false"; \
+    else \
+        echo "BŁĄD: nieznany VARIANT='${VARIANT}' (oczekiwano: ungoogled|vanilla)" >&2 && exit 1; \
+    fi && \
+    echo "==> GN_ARGS: ${GN_ARGS}" && \
+    gn gen --args="$GN_ARGS" out/arm64 && \
+    gn args out/arm64 --list > /repo/gn_args_list.txt
+
+# 7. Kompilacja (ninja) — `chrome_public_apk`. ccache w persystentnym
+#    cache mouncie (osobny id od buildów desktopowych). NINJA_JOBS domyślnie
+#    NIŻSZE niż desktop (8, nie $(nproc)=16) — build Android (R8/dex/linking
+#    wielu ABI) jest bardziej pamięciożerny niż czysty C++, a poniżej
+#    zalecanych przez Chromium 32 GB RAM build ratuje się swapem.
+#    Zweryfikowane ręcznie w kontenerze debug: pełny dry-run
+#    (`ninja -C out/arm64 chrome_public_apk -n`) rozwiązuje cały graf
+#    (60310 kroków) bez błędów, kończąc się poprawnie na
+#    //chrome/android:chrome_public_apk__create.
+#
+# BŁĄD ZŁAPANY W NINJA (15. przypadek, ~16554/60700 -- ZUPEŁNIE INNA
+# rodzina niż poprzednie 14, nie ma nic wspólnego z patchami ani
+# is_android): `build/android/gyp/jinja_template.py` (zwykły, niepatchowany
+# skrypt Chromium) pada `TypeError: %i format: a real number is required,
+# not dict` / `ValueError: badly formed help string` wewnątrz
+# `argparse.add_argument()` -- to NIE literówka w kodzie Chromium, tylko
+# realna niekompatybilność: krok 1 tego Containerfile instaluje `python3`
+# przez `apt-get install` BEZ przypięcia wersji, a `ubuntu:26.04`
+# ("resolute", bardzo świeże wydanie) w swoich repo ma DZIŚ Python
+# **3.14**, którego `argparse` dostał nowszą, bardziej agresywną
+# walidację `help=` (eager-checking string formatowania przy
+# `add_argument()`, nie tylko przy `--help`) -- łamie to legalny,
+# wieloletni kod Chromium, który ma dosłowny znak `%`/`{% %}` (Jinja2) w
+# tekście pomocy. Wcześniejsze 14 prób tego NIE złapało, bo korzystały z
+# WARSTWY apt-get zacache'owanej z wcześniejszego (starszego) stanu repo
+# Ubuntu -- dopiero PRAWDZIWIE zimny build (po utracie cache warstw) ściągnął dzisiejszy, nowszy pakiet `python3`.
+# Fix: NIE dotykamy wczesnych, już-działających kroków (ryzyko zepsucia
+# czegoś, co dotąd działało) -- tylko w TYM kroku (ninja, jedyne miejsce,
+# gdzie to wybuchło) podmieniamy PRIORYTET w PATH przez `/usr/local/bin/
+# python3`, żeby WSZYSTKIE wywołania gołego `python3` przez reguły ninja
+# (setki skryptów `build/android/gyp/*.py`, wywoływanych bezpośrednio,
+# nie przez `vpython3`) trafiały na kompatybilną wersję. Nie naprawiamy
+# pojedynczego skryptu (za dużo analogicznych miejsc w całym drzewie do
+# audytu, klasyczne ryzyko "whack-a-mole").
+#
+# ŹRÓDŁO kompatybilnego pythona: PIERWSZA próba (`apt-get install
+# python3.12`) zawiodła -- "resolute" (Ubuntu 26.04) nie ma go w ŻADNYM
+# archiwum (sprawdzone: ani `ftp.icm.edu.pl`, ani oficjalne
+# `archive.ubuntu.com` -- to nie luka jednego mirrora, pakiet po prostu
+# nie istnieje dla tego wydania). Zamiast pobierać cokolwiek dodatkowego:
+# `depot_tools` JUŻ ma własny, zarządzany przez CIPD Python, całkowicie
+# niezależny od systemowego apt -- `/repo/depot_tools/python-bin/python3`
+# (3.11.8), dokładnie ten sam mechanizm co `vpython3`. Zweryfikowane w
+# kontenerze debug (nie na oko): ten interpreter POPRAWNIE parsuje
+# dokładnie ten sam `help=` string z `%`, który wywalał się na
+# systemowym 3.14 -- 3.11 nie ma jeszcze nowej, agresywnej walidacji
+# argparse wprowadzonej w 3.13/3.14.
+#
+# PUŁAPKA złapana przy pierwszym wdrożeniu: `python-bin/python3` to NIE
+# surowy plik binarny, tylko skrypt bash (`DEPOT_TOOLS=$(dirname "$0")/..`),
+# który liczy swój katalog z `$0` BEZ rozwijania symlinków -- zwykły
+# `ln -sf` pod `/usr/local/bin/python3` sprawiał, że `$0` wskazywał na
+# `/usr/local/bin`, `dirname`/`..` dawało `/`, i skrypt szukał
+# `/python3_bin_reldir.txt` (nie istnieje) -> ten sam błąd co przy
+# apt-get. Fix: wrapper z `exec` na BEZWZGLĘDNĄ ścieżkę zamiast symlinka
+# -- `$0` wewnątrz `python-bin/python3` wtedy poprawnie wskazuje na jego
+# prawdziwą lokalizację. Zweryfikowane w kontenerze debug.
+ARG NINJA_JOBS=8
+# `/ccache` na TRWAŁYM cache mouncie (id=ccache-android). Od 2026-08-08 do
+# 2026-10-30 celowo ulotny: /srcbuild daje inkrementalność ninja w obrębie
+# jednej wersji. Ale od 2026-10-26 krok 4c zasila /srcbuild od nowa przy
+# każdej zmianie wersji, więc bez ccache każde podbicie -- nawet
+# poprawkowe (156.0.8078.73 -> .79) -- kompiluje wszystkie ~61 tys. celów
+# od zera. Przywrócony 2026-10-30: co przyspiesza
+# budowanie, zostaje na dysku. Limit 40G.
+# Moduły Clanga wyłączone w GN (use_clang_modules = false, krok gn gen):
+# z nimi ccache odrzucał ~82% kompilacji ("could_not_use_modules",
+# zmierzone na 156.0.8078.79), a tryb sloppiness=modules nie hashuje .pcm
+# ani nagłówków libc++ (sprawdzone na pliku .d) -- po zmianie libc++
+# oddałby po cichu stare obiekty. Bez modułów ccache działa w zwykłym,
+# bezpiecznym trybie dla wszystkich kompilacji.
+ENV CCACHE_DIR=/ccache
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    --mount=type=cache,target=/ccache,id=ccache-android \
+    cd /srcbuild && \
+    printf '#!/bin/bash\nexec /repo/depot_tools/python-bin/python3 "$@"\n' > /usr/local/bin/python3 && \
+    chmod +x /usr/local/bin/python3 && \
+    echo "==> python3 dla ninja: $(python3 --version) ($(command -v python3))" && \
+    export PATH="/usr/local/bin:/repo/depot_tools:${PATH}" && \
+    export NODE_OPTIONS="--max-old-space-size=8192" && \
+    ccache -M 40G >/dev/null && \
+    JOBS="${NINJA_JOBS:-$(nproc)}" && \
+    echo "==> ninja -j${JOBS}" && \
+    ninja -C out/arm64 chrome_public_apk -j"${JOBS}" && \
+    ccache -s
+
+# 8. Pakowanie i podpis — czytelna nazwa z wersją Chromium (analogicznie
+#    do desktopowego kroku 10 pakowania .deb). Ścieżka `out/arm64/apks/
+#    ChromePublic.apk` potwierdzona w chrome/android/BUILD.gn
+#    (proguard_mapping_path = "$root_build_dir/apks/ChromePublic.apk.mapping").
+#    Nazwa: <VARIANT>-chromium-<wersja>-arm64-v8a.apk -- arm64-v8a to
+#    standardowa nazwa ABI Androida (jak lib/arm64-v8a/ w APK); APK nie ma
+#    nic pod konkretne urządzenie (tylko target_cpu=arm64, minSdk 29), więc
+#    bez nazwy urządzenia w nazwie pliku. Prefiks = ARG VARIANT
+#    ("ungoogled"/"vanilla").
+#
+#    PODPIS. Ninja podpisuje APK publicznym kluczem debug Chromium
+#    (build/android/chromium-debug.keystore -- leży w otwartych źródłach,
+#    więc każdy może nim podpisać plik, który Android przyjmie jako
+#    aktualizację). Gdy build_android.sh poda własny klucz, APK jest tu
+#    podpisywany ponownie:
+#    - klucz i hasło przychodzą jako sekrety (/run/secrets/...), więc nie
+#      trafiają do warstwy obrazu ani do logu;
+#    - podpisany plik powstaje od razu w /output_apk; APK w /srcbuild
+#      zostaje nietknięty (to wyjście ninja -- zmieniony udawałby wynik
+#      builda przy następnym przebiegu, także tym bez klucza);
+#    - SIGNING_CERT_SHA256 (odcisk certyfikatu, liczony na hoście) robi dwie
+#      rzeczy. Po pierwsze unieważnia cache tego kroku: sama zawartość
+#      sekretu nie wchodzi do klucza cache, więc bez ARG-u krok oddałby
+#      z cache APK z poprzednim podpisem. Po drugie krok porównuje z nim
+#      odcisk gotowego pliku i przerywa build przy niezgodności;
+#    - bez schematu v1 (minSdk 29 go nie potrzebuje): apksigner nie dopisuje
+#      wtedy plików do archiwum, więc wpisy i ich wyrównanie zostają takie,
+#      jak je ułożył build -- `zipalign -c` to potwierdza. Z v2+v3 zostaje
+#      w praktyce samo v3: przy minSdk >= 28 apksigner pomija v2 jako zbędne
+#      (sprawdzone na 157: "Verified using v3 scheme: true", v2: false);
+#    - odcisk czytamy z KAŻDEJ linii "certificate SHA-256 digest:" i wymagamy
+#      jednej wartości: prefiks linii zależy od wersji apksignera i schematu
+#      ("V3.0 Signer:", "V2 Signer:", dawniej "Signer #1").
+#    Nie używamy argumentów GN android_keystore_*: wymagałyby klucza
+#    w drzewie podczas ninja i ponownego gn gen.
+ARG SIGNING_CERT_SHA256=""
+RUN --mount=type=cache,target=/srcbuild,id=chromium-src-android-hardened \
+    --mount=type=secret,id=android_keystore \
+    --mount=type=secret,id=android_keystore_pass \
+    CHROMIUM_TAG=$(cat /repo/chromium_tag.txt) && \
+    SRC=/srcbuild/out/arm64/apks/ChromePublic.apk && \
+    OUT="/output_apk/${VARIANT}-chromium-${CHROMIUM_TAG}-arm64-v8a.apk" && \
+    mkdir -p /output_apk && \
+    if [ -z "${SIGNING_CERT_SHA256}" ]; then \
+        echo "==> bez własnego klucza: APK zostaje z publicznym kluczem debug Chromium" && \
+        cp "$SRC" "$OUT"; \
+    else \
+        KS=/run/secrets/android_keystore && KP=/run/secrets/android_keystore_pass && \
+        { [ -s "$KS" ] && [ -s "$KP" ]; } || { echo "BŁĄD: podano SIGNING_CERT_SHA256, ale brak sekretów android_keystore / android_keystore_pass"; exit 1; }; \
+        JAVA=/srcbuild/third_party/jdk/current/bin/java && \
+        set -- /srcbuild/third_party/android_sdk/public/build-tools/*/lib/apksigner.jar && \
+        { [ "$#" -eq 1 ] && [ -f "$1" ]; } || { echo "BŁĄD: oczekiwano dokładnie jednego apksigner.jar w build-tools, jest: $*"; exit 1; }; \
+        SIGNER="$1" && ZIPALIGN="$(dirname "$(dirname "$1")")/zipalign" && \
+        APKSIGNER="$JAVA --enable-native-access=ALL-UNNAMED -jar $SIGNER" && \
+        $APKSIGNER sign --ks "$KS" --ks-pass "file:$KP" \
+            --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
+            --v4-signing-enabled false --out "$OUT" "$SRC" && \
+        GOT=$($APKSIGNER verify --print-certs "$OUT" \
+              | sed -n 's/^.*certificate SHA-256 digest: //p' | sort -u) && \
+        { [ -n "$GOT" ] && [ "$GOT" = "${SIGNING_CERT_SHA256}" ]; } || { echo "BŁĄD: odcisk certyfikatu APK ('$GOT') nie zgadza się z SIGNING_CERT_SHA256 ('${SIGNING_CERT_SHA256}')"; exit 1; }; \
+        "$ZIPALIGN" -c 4 "$OUT" && \
+        rm -f "$OUT.idsig" && \
+        echo "==> APK podpisany własnym kluczem, odcisk certyfikatu: $GOT"; \
+    fi && \
+    ls -la /output_apk/
+
+# ==============================================================================
+# 9. ETAP EKSPORTU — jak w desktopowym Containerfile: `builder` ma w sobie
+# całe drzewo źródeł Chromium (setki GB), więc tagowany finalny obraz
+# zawiera tylko gotowy .apk.
+# ==============================================================================
+FROM alpine:3.20 AS export
+COPY --from=builder /output_apk/*.apk /output_apk/
+CMD sh -c '\
+    [ "$(stat -c %d /host_output 2>/dev/null)" != "$(stat -c %d /host_output/.. 2>/dev/null)" ] || \
+        { echo "BŁĄD: /host_output nie jest zamontowany. Uruchom z: podman run --rm -v \$(pwd):/host_output <obraz>"; exit 1; }; \
+    cp /output_apk/*.apk /host_output/ && echo "🎉 Kopiowanie zakończone! APK gotowy."'

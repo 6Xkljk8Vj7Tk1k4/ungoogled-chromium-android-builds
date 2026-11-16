@@ -1,0 +1,22 @@
+# Wbudowany updater APK (opis: README, sekcja o autoupdaterze).
+#
+# Krok 5g w Containerfile.android kopiuje ten plik do drzewa Chromium jako
+# chrome/browser/self_update/android/BUILD.gn, a źródła z self_update/ do
+# java/src/... obok niego. UpdaterConfig.java nie ma w repo: ten sam krok
+# generuje go z parametrów builda (UPDATE_REPO, RELEASE_TAG, UPDATE_API_URL).
+#
+# Kod używa wyłącznie API Androida (kontekst aplikacji dostaje od wołającego),
+# więc cel nie ma żadnych zależności i podbicia wersji Chromium go nie dotykają.
+
+import("//build/config/android/rules.gni")
+
+android_library("java") {
+  sources = [
+    "java/src/org/chromium/chrome/browser/self_update/ApkDownloader.java",
+    "java/src/org/chromium/chrome/browser/self_update/Installer.java",
+    "java/src/org/chromium/chrome/browser/self_update/SelfUpdateResultReceiver.java",
+    "java/src/org/chromium/chrome/browser/self_update/SelfUpdater.java",
+    "java/src/org/chromium/chrome/browser/self_update/UpdateChecker.java",
+    "java/src/org/chromium/chrome/browser/self_update/UpdaterConfig.java",
+  ]
+}

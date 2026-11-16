@@ -1,0 +1,4 @@
+*.apk
+build_*.log
+# Klucz podpisu i jego zaszyfrowana kopia nigdy nie trafiają do publicznego repo.
+secrets/
